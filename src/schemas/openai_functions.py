@@ -241,6 +241,32 @@ TOOLS: list[dict[str, Any]] = [
 ]
 
 
+_engine_instance = None
+_db_instance = None
+
+
+async def _get_engine():
+    """获取或创建单例引擎（避免每次调用都重新初始化）。"""
+    global _engine_instance, _db_instance
+    if _engine_instance is None:
+        from pathlib import Path
+        from ..engine.mail_engine import MailEngine
+        from ..storage.database import Database
+        from ..storage.token_store import TokenStore
+        import os
+
+        data_dir = Path.home() / ".unimail" / "data"
+        data_dir.mkdir(parents=True, exist_ok=True)
+
+        passphrase = os.environ.get("UNIMAIL_PASSPHRASE", "unimail-default")
+        _db_instance = Database(data_dir / "unimail.db")
+        token_store = TokenStore(data_dir / "tokens.enc", passphrase)
+        _engine_instance = MailEngine(_db_instance, token_store)
+        await _engine_instance.initialize()
+
+    return _engine_instance, _db_instance
+
+
 async def dispatch(name: str, args: dict[str, Any]) -> str:
     """调度函数 - 接收函数名和参数字典，调用 MailEngine 执行并返回结果字符串。
 
@@ -254,27 +280,8 @@ async def dispatch(name: str, args: dict[str, Any]) -> str:
     Returns:
         执行结果的字符串表示
     """
-    from pathlib import Path
-    from ..engine.mail_engine import MailEngine
-    from ..storage.database import Database
-    from ..storage.token_store import TokenStore
-
-    # 初始化引擎
-    data_dir = Path.home() / ".unimail" / "data"
-    data_dir.mkdir(parents=True, exist_ok=True)
-
-    import os
-    passphrase = os.environ.get("UNIMAIL_PASSPHRASE", "unimail-default")
-    db = Database(data_dir / "unimail.db")
-    token_store = TokenStore(data_dir / "tokens.enc", passphrase)
-    engine = MailEngine(db, token_store)
-    await engine.initialize()
-
-    try:
-        result = await _execute(engine, db, name, args)
-        return result
-    finally:
-        await engine.shutdown()
+    engine, db = await _get_engine()
+    return await _execute(engine, db, name, args)
 
 
 async def _execute(engine, db, name: str, args: dict[str, Any]) -> str:
