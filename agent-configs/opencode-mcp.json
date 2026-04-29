@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "unimail": {
+      "command": "unimail",
+      "args": ["serve", "--mode", "mcp"],
+      "env": {
+        "UNIMAIL_PASSPHRASE": "your-passphrase"
+      }
+    }
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "schema_version": "v1",
+  "name_for_human": "UniMail",
+  "name_for_model": "unimail",
+  "description_for_human": "Read, send, search, and manage emails across Gmail, Outlook, and IMAP providers.",
+  "description_for_model": "UniMail is a unified email gateway. Use it to list inbox emails, read email content, send new emails (supports Markdown body), reply to emails, search by keywords/sender/date, manage accounts, archive/trash emails, and download attachments.",
+  "auth": {
+    "type": "service_http",
+    "authorization_type": "bearer",
+    "verification_tokens": {}
+  },
+  "api": {
+    "type": "openapi",
+    "url": "http://localhost:8765/openapi.json",
+    "is_user_authenticated": false
+  },
+  "logo_url": "",
+  "contact_email": "",
+  "legal_info_url": ""
+}

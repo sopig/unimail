@@ -21,63 +21,136 @@ from .storage.token_store import TokenStore
 
 class SendRequest(BaseModel):
     """发送邮件请求体"""
-    to: list[str] = Field(..., description="收件人邮箱列表")
-    subject: str = Field(..., description="邮件主题")
-    body: str = Field(..., description="邮件正文（Markdown 格式，自动转 HTML）")
-    from_: Optional[str] = Field(None, alias="from", description="发件邮箱地址，不指定用默认账号")
-    cc: list[str] = Field(default_factory=list, description="抄送")
-    bcc: list[str] = Field(default_factory=list, description="密送")
-    attachments: list[str] = Field(default_factory=list, description="附件本地文件路径列表")
+    to: list[str] = Field(
+        ...,
+        description="收件人邮箱列表",
+        json_schema_extra={"example": ["user@example.com"]},
+    )
+    subject: str = Field(
+        ...,
+        description="邮件主题",
+        json_schema_extra={"example": "Meeting Tomorrow"},
+    )
+    body: str = Field(
+        ...,
+        description="邮件正文（Markdown 格式，自动转 HTML）",
+        json_schema_extra={"example": "# Hello\n\nLet's meet at **3pm**."},
+    )
+    from_: Optional[str] = Field(
+        None,
+        alias="from",
+        description="发件邮箱地址，不指定则使用默认账号",
+        json_schema_extra={"example": "me@gmail.com"},
+    )
+    cc: list[str] = Field(
+        default_factory=list,
+        description="抄送收件人列表",
+        json_schema_extra={"example": ["cc@example.com"]},
+    )
+    bcc: list[str] = Field(
+        default_factory=list,
+        description="密送收件人列表",
+        json_schema_extra={"example": []},
+    )
+    attachments: list[str] = Field(
+        default_factory=list,
+        description="附件本地文件路径列表",
+        json_schema_extra={"example": ["/tmp/report.pdf"]},
+    )
 
-    class Config:
-        populate_by_name = True
+    model_config = {"populate_by_name": True, "json_schema_extra": {
+        "example": {
+            "to": ["user@example.com"],
+            "subject": "Meeting Tomorrow",
+            "body": "# Hello\n\nLet's meet at **3pm**.",
+            "cc": [],
+            "bcc": [],
+            "attachments": [],
+        }
+    }}
 
 
 class ReplyRequest(BaseModel):
     """回复邮件请求体"""
-    body: str = Field(..., description="回复内容（Markdown）")
-    reply_all: bool = Field(False, description="是否回复所有人")
+    body: str = Field(
+        ...,
+        description="回复内容（Markdown 格式）",
+        json_schema_extra={"example": "Thanks, I'll be there!"},
+    )
+    reply_all: bool = Field(
+        False,
+        description="是否回复所有人（包括 To 和 Cc 中的所有收件人）",
+    )
+
+    model_config = {"json_schema_extra": {
+        "example": {"body": "Thanks, I'll be there!", "reply_all": False}
+    }}
 
 
 class SendResult(BaseModel):
-    """发送结果"""
-    message_id: str
-    from_: str = Field(alias="from")
-    to: list[str]
-    subject: str
+    """发送结果 - 邮件发送成功后返回"""
+    message_id: str = Field(description="新邮件的唯一消息 ID")
+    from_: str = Field(alias="from", description="实际发件人邮箱地址")
+    to: list[str] = Field(description="收件人列表")
+    subject: str = Field(description="邮件主题")
 
-    class Config:
-        populate_by_name = True
+    model_config = {"populate_by_name": True, "json_schema_extra": {
+        "example": {
+            "message_id": "gmail_abc123",
+            "from": "me@gmail.com",
+            "to": ["user@example.com"],
+            "subject": "Meeting Tomorrow",
+        }
+    }}
 
 
 class ReplyResult(BaseModel):
-    """回复结果"""
-    message_id: str
-    from_: str = Field(alias="from")
-    to: list[str]
+    """回复结果 - 回复邮件成功后返回"""
+    message_id: str = Field(description="回复邮件的消息 ID")
+    from_: str = Field(alias="from", description="发件人邮箱地址")
+    to: list[str] = Field(description="回复的收件人列表")
 
-    class Config:
-        populate_by_name = True
+    model_config = {"populate_by_name": True, "json_schema_extra": {
+        "example": {
+            "message_id": "gmail_reply_456",
+            "from": "me@gmail.com",
+            "to": ["sender@example.com"],
+        }
+    }}
 
 
 class AccountInfo(BaseModel):
-    """账户信息"""
-    id: str
-    provider: str
-    email: str
-    display_name: str
-    is_default: bool
+    """已连接的邮箱账户信息"""
+    id: str = Field(description="账户唯一 ID")
+    provider: str = Field(description="邮箱提供商: gmail/outlook/imap")
+    email: str = Field(description="邮箱地址")
+    display_name: str = Field(description="显示名称")
+    is_default: bool = Field(description="是否为默认发件账户")
+
+    model_config = {"json_schema_extra": {
+        "example": {
+            "id": "a1b2c3d4",
+            "provider": "gmail",
+            "email": "user@gmail.com",
+            "display_name": "user",
+            "is_default": True,
+        }
+    }}
 
 
 class ArchiveResult(BaseModel):
     """归档结果"""
-    message_id: str
-    status: str
+    message_id: str = Field(description="被归档的邮件 ID")
+    status: str = Field(description="操作状态: archived")
+
+    model_config = {"json_schema_extra": {
+        "example": {"message_id": "gmail_abc123", "status": "archived"}
+    }}
 
 
 class ErrorResponse(BaseModel):
     """错误响应"""
-    detail: str
+    detail: str = Field(description="错误描述信息")
 
 
 # === 应用工厂 ===
@@ -122,8 +195,14 @@ def create_app(
             await engine.shutdown()
 
     app = FastAPI(
-        title="UniMail API",
-        description="📮 Unified email gateway for AI agents — REST API",
+        title="UniMail",
+        description=(
+            "Unified email gateway for AI agents. "
+            "Provides a single REST API to read, send, search, and manage emails "
+            "across multiple providers (Gmail, Outlook, IMAP/SMTP). "
+            "Supports Markdown email bodies with automatic HTML conversion, "
+            "multi-account management, and attachment handling."
+        ),
         version="0.1.0",
         lifespan=lifespan,
     )
@@ -165,17 +244,34 @@ def create_app(
     @app.get(
         "/api/mail",
         response_model=list[dict],
-        summary="查看邮件列表",
+        summary="列出邮件",
+        description="列出收件箱或其他文件夹中的邮件，返回最近的邮件摘要列表（含发件人、主题、时间、已读状态）。AI Agent 调用此端点获取邮件概览。",
         dependencies=[Depends(verify_token)],
     )
     async def list_mail(
         request: Request,
-        folder: str = Query("inbox", description="文件夹: inbox/sent/drafts/archive/all"),
-        limit: int = Query(20, ge=1, le=50, description="返回数量"),
-        unread_only: bool = Query(False, description="只看未读"),
-        account: Optional[str] = Query(None, description="邮箱地址过滤"),
+        folder: str = Query(
+            "inbox",
+            description="邮件文件夹，可选值: inbox(收件箱)/sent(已发送)/drafts(草稿)/archive(归档)/all(全部)",
+            examples=["inbox", "sent", "archive"],
+        ),
+        limit: int = Query(
+            20, ge=1, le=50,
+            description="返回的最大邮件数量（1-50）",
+            examples=[20],
+        ),
+        unread_only: bool = Query(
+            False,
+            description="设为 true 时只返回未读邮件",
+            examples=[False],
+        ),
+        account: Optional[str] = Query(
+            None,
+            description="按邮箱地址过滤，只查询指定账户的邮件",
+            examples=["user@gmail.com"],
+        ),
     ):
-        """查看邮件列表。返回收件箱/已发送/所有邮件的摘要信息。"""
+        """列出邮件。返回收件箱/已发送/所有邮件的摘要信息（发件人、主题、时间、已读状态）。"""
         eng = get_engine(request)
         try:
             messages = await eng.list_messages(
@@ -194,15 +290,28 @@ def create_app(
         "/api/mail/search",
         response_model=list[dict],
         summary="搜索邮件",
+        description="通过关键词搜索邮件。搜索范围覆盖主题、正文、发件人。返回匹配的邮件摘要列表，按时间倒序排列。",
         dependencies=[Depends(verify_token)],
     )
     async def search_mail(
         request: Request,
-        q: str = Query(..., description="搜索关键词"),
-        account: Optional[str] = Query(None, description="限定搜索的账户"),
-        limit: int = Query(10, ge=1, le=50, description="返回数量"),
+        q: str = Query(
+            ...,
+            description="搜索关键词，匹配邮件主题、正文和发件人",
+            examples=["invoice", "meeting notes"],
+        ),
+        account: Optional[str] = Query(
+            None,
+            description="限定搜索范围到指定邮箱账户",
+            examples=["user@gmail.com"],
+        ),
+        limit: int = Query(
+            10, ge=1, le=50,
+            description="返回的最大结果数（1-50）",
+            examples=[10],
+        ),
     ):
-        """搜索邮件。支持关键词、发件人、日期范围等条件。"""
+        """搜索邮件。支持关键词匹配主题、正文和发件人。"""
         eng = get_engine(request)
         try:
             messages = await eng.search_messages(
@@ -219,10 +328,11 @@ def create_app(
     @app.get(
         "/api/mail/{message_id}",
         summary="读取邮件详情",
+        description="读取一封邮件的完整内容，包括正文文本、HTML、附件列表。调用后自动标记为已读。message_id 从 /api/mail 或 /api/mail/search 结果中获取。",
         dependencies=[Depends(verify_token)],
     )
     async def read_mail(request: Request, message_id: str):
-        """读取邮件完整内容，包括正文和附件列表。"""
+        """读取邮件完整内容，包括正文和附件列表。自动标记为已读。"""
         eng = get_engine(request)
         try:
             msg = await eng.get_message(message_id)
@@ -237,10 +347,11 @@ def create_app(
         "/api/mail/send",
         response_model=SendResult,
         summary="发送邮件",
+        description="发送一封新邮件。正文使用 Markdown 格式编写，系统自动转为 HTML。支持多收件人、抄送、密送和附件。如不指定发件账号则使用默认账户。",
         dependencies=[Depends(verify_token)],
     )
     async def send_mail(request: Request, body: SendRequest):
-        """发送邮件。支持指定发件账号、附件、Markdown 正文（自动转 HTML）。"""
+        """发送邮件。正文为 Markdown 格式（自动转 HTML），支持附件。"""
         eng = get_engine(request)
         try:
             result = await eng.send_message(
@@ -267,10 +378,11 @@ def create_app(
         "/api/mail/{message_id}/reply",
         response_model=ReplyResult,
         summary="回复邮件",
+        description="回复一封邮件。自动使用原始收件账号作为发件人，引用原始主题。支持回复所有人（reply_all=true 时同时回复 To 和 Cc 中的所有人）。",
         dependencies=[Depends(verify_token)],
     )
     async def reply_mail(request: Request, message_id: str, body: ReplyRequest):
-        """回复一封邮件（自动使用原账号、引用原主题）。"""
+        """回复邮件（自动使用原账号、引用原主题）。"""
         eng = get_engine(request)
         try:
             result = await eng.reply_message(
@@ -292,10 +404,11 @@ def create_app(
         "/api/accounts",
         response_model=list[AccountInfo],
         summary="查看已连接账户",
+        description="列出所有已连接的邮箱账户及其状态。返回每个账户的提供商类型、邮箱地址、显示名称，以及哪个是默认发件账户。",
         dependencies=[Depends(verify_token)],
     )
     async def list_accounts(request: Request):
-        """查看已连接的邮箱账户列表及状态。"""
+        """列出所有已连接的邮箱账户。"""
         db = get_db(request)
         accounts = db.get_accounts()
         return [
@@ -313,10 +426,11 @@ def create_app(
         "/api/mail/{message_id}/archive",
         response_model=ArchiveResult,
         summary="归档邮件",
+        description="将指定邮件移至归档文件夹。归档后邮件不再出现在收件箱中，但仍可通过搜索或 folder=archive 访问。",
         dependencies=[Depends(verify_token)],
     )
     async def archive_mail(request: Request, message_id: str):
-        """将邮件归档。"""
+        """归档邮件 - 移出收件箱但保留可搜索。"""
         eng = get_engine(request)
         try:
             await eng.archive_messages([message_id])
@@ -329,10 +443,11 @@ def create_app(
     @app.get(
         "/api/mail/{message_id}/attachments/{filename}",
         summary="下载附件",
+        description="下载邮件中的附件文件。通过 filename 精确匹配附件名称，返回二进制文件内容。filename 可从邮件详情的 attachments 列表中获取。",
         dependencies=[Depends(verify_token)],
     )
     async def download_attachment(request: Request, message_id: str, filename: str):
-        """下载邮件附件。通过 filename 匹配附件并返回文件内容。"""
+        """下载邮件附件。通过 filename 匹配，返回文件内容。"""
         eng = get_engine(request)
         try:
             # 先获取邮件，找到附件 ID

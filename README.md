@@ -182,6 +182,88 @@ unimail search "invoice"
 unimail search "meeting" --account your@gmail.com --limit 5
 ```
 
+## Agent Integration
+
+UniMail supports all major AI agent frameworks through multiple integration methods:
+
+| Agent / Framework | Integration Method | Config File |
+|---|---|---|
+| **Claude Code** | MCP Server (stdio) | `agent-configs/claude-code.json` |
+| **Cursor** | MCP Server (stdio) | `agent-configs/cursor-mcp.json` |
+| **OpenCode** | MCP Server (stdio) | `agent-configs/opencode-mcp.json` |
+| **Codex (OpenAI)** | OpenAI Function Calling | `unimail schema openai` |
+| **LangChain / LangGraph** | LangChain Tools | `agent-configs/langchain-example.py` |
+| **Dify** | OpenAPI Plugin | `agent-configs/dify-openapi.yaml` |
+| **Coze** | OpenAPI Plugin | `agent-configs/dify-openapi.yaml` |
+| **AutoGPT** | Plugin Manifest | `agent-configs/autogpt-plugin.json` |
+| **Custom Agent** | REST API / OpenAI Schema | `/openapi.json` or `unimail schema openai` |
+
+### Quick Setup by Agent
+
+#### Claude Code / Cursor / OpenCode (MCP)
+
+Copy the config to your agent's MCP configuration:
+
+```json
+{
+  "mcpServers": {
+    "unimail": {
+      "command": "unimail",
+      "args": ["serve", "--mode", "mcp"],
+      "env": {"UNIMAIL_PASSPHRASE": "your-passphrase"}
+    }
+  }
+}
+```
+
+#### OpenAI Function Calling (Codex, GPT-4, etc.)
+
+```python
+from src.schemas.openai_functions import TOOLS, dispatch
+
+# Pass TOOLS to OpenAI API
+response = client.chat.completions.create(
+    model="gpt-4o",
+    messages=messages,
+    tools=TOOLS,
+)
+
+# Handle function calls
+for tool_call in response.choices[0].message.tool_calls:
+    result = await dispatch(tool_call.function.name, json.loads(tool_call.function.arguments))
+```
+
+#### LangChain
+
+```bash
+pip install unimail[langchain]
+```
+
+```python
+from src.integrations.langchain_tools import get_all_tools
+
+tools = get_all_tools()  # Returns 8 LangChain tools
+agent = create_react_agent(llm, tools)
+```
+
+#### Dify / Coze (OpenAPI Plugin)
+
+1. Start the REST API: `unimail serve --mode api --port 8765`
+2. In Dify/Coze, create an OpenAPI plugin pointing to: `http://localhost:8765/openapi.json`
+
+#### Schema Export CLI
+
+```bash
+# OpenAI function calling format
+unimail schema openai
+
+# OpenAPI spec (for REST API integrations)
+unimail schema openapi
+
+# MCP tool definitions
+unimail schema mcp
+```
+
 ## Architecture
 
 ```
@@ -249,6 +331,10 @@ unimail/
 │   ├── models.py          # Core data models (Pydantic)
 │   ├── server.py          # MCP Server (tools registration)
 │   ├── api.py             # REST API (FastAPI)
+│   ├── schemas/           # Schema exports for various formats
+│   │   └── openai_functions.py  # OpenAI function calling TOOLS + dispatch
+│   ├── integrations/      # Framework-specific wrappers
+│   │   └── langchain_tools.py   # LangChain @tool wrappers
 │   ├── connectors/        # Provider-specific connectors
 │   │   ├── base.py        # Abstract interface
 │   │   ├── gmail_connector.py
@@ -265,6 +351,13 @@ unimail/
 │   │   └── outlook_auth.py
 │   └── cli/               # CLI commands
 │       └── main.py
+├── agent-configs/         # Ready-to-use configs for each agent
+│   ├── claude-code.json
+│   ├── cursor-mcp.json
+│   ├── opencode-mcp.json
+│   ├── dify-openapi.yaml
+│   ├── autogpt-plugin.json
+│   └── langchain-example.py
 ├── pyproject.toml
 └── README.md
 ```

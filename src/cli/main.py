@@ -640,6 +640,58 @@ async def _run_all(passphrase: str, port: int):
 # ========== Utility ==========
 
 
+# ========== Schema Export ==========
+
+
+@cli.group()
+def schema():
+    """📋 Export tool schemas for various AI agent integrations."""
+    pass
+
+
+@schema.command("openai")
+def schema_openai():
+    """Output OpenAI function calling JSON schema to stdout."""
+    import json as json_mod
+    from ..schemas.openai_functions import TOOLS
+    click.echo(json_mod.dumps(TOOLS, indent=2, ensure_ascii=False))
+
+
+@schema.command("openapi")
+@click.option("--port", type=int, default=8765, help="API server port (for server URLs)")
+@click.pass_context
+def schema_openapi(ctx, port: int):
+    """Output OpenAPI spec JSON to stdout."""
+    import json as json_mod
+    from ..api import create_app
+
+    passphrase = ctx.obj["passphrase"]
+    app = create_app(passphrase)
+    spec = app.openapi()
+    click.echo(json_mod.dumps(spec, indent=2, ensure_ascii=False))
+
+
+@schema.command("mcp")
+def schema_mcp():
+    """Output MCP tool definitions to stdout."""
+    import json as json_mod
+    from ..schemas.openai_functions import TOOLS
+
+    # 将 OpenAI function calling 格式转为 MCP tool 格式
+    mcp_tools = [
+        {
+            "name": t["function"]["name"],
+            "description": t["function"]["description"],
+            "inputSchema": t["function"]["parameters"],
+        }
+        for t in TOOLS
+    ]
+    click.echo(json_mod.dumps(mcp_tools, indent=2, ensure_ascii=False))
+
+
+# ========== Utility ==========
+
+
 @cli.command("sync")
 @click.pass_context
 def sync(ctx):

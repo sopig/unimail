@@ -1,0 +1,34 @@
+# Dify / Coze 插件配置 — 指向 UniMail REST API
+# 将此文件用于 Dify 的 "API-Based Extension" 或 Coze 的 "Plugin" 配置
+
+openapi: "3.1.0"
+info:
+  title: UniMail
+  description: Unified email gateway for AI agents
+  version: "0.1.0"
+
+servers:
+  - url: http://localhost:8765
+    description: Local UniMail REST API server
+
+# 认证配置（如果设置了 UNIMAIL_API_TOKEN）
+security:
+  - bearerAuth: []
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: "Set UNIMAIL_API_TOKEN env var on the server side"
+
+# 使用说明：
+# 1. 启动 UniMail REST API: unimail serve --mode api --port 8765
+# 2. 在 Dify 中创建 "API-Based Extension"，填入 OpenAPI spec URL:
+#    http://localhost:8765/openapi.json
+# 3. 如果需要认证，设置 Bearer Token（与 UNIMAIL_API_TOKEN 一致）
+#
+# Coze 插件：
+# 1. 在 Coze 平台 → 插件 → 创建插件 → 选择 "OpenAPI"
+# 2. 填入 OpenAPI spec URL: http://localhost:8765/openapi.json
+# 3. 配置认证方式为 Bearer Token
