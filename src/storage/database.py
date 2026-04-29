@@ -54,6 +54,24 @@ CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
     content_rowid=rowid
 );
 
+-- Triggers to keep FTS index in sync with content table
+CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
+    INSERT INTO messages_fts(rowid, subject, snippet, body_text, from_email, from_name)
+    VALUES (new.rowid, new.subject, new.snippet, new.body_text, new.from_email, new.from_name);
+END;
+
+CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
+    INSERT INTO messages_fts(messages_fts, rowid, subject, snippet, body_text, from_email, from_name)
+    VALUES ('delete', old.rowid, old.subject, old.snippet, old.body_text, old.from_email, old.from_name);
+END;
+
+CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages BEGIN
+    INSERT INTO messages_fts(messages_fts, rowid, subject, snippet, body_text, from_email, from_name)
+    VALUES ('delete', old.rowid, old.subject, old.snippet, old.body_text, old.from_email, old.from_name);
+    INSERT INTO messages_fts(rowid, subject, snippet, body_text, from_email, from_name)
+    VALUES (new.rowid, new.subject, new.snippet, new.body_text, new.from_email, new.from_name);
+END;
+
 CREATE TABLE IF NOT EXISTS sync_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     account_id TEXT NOT NULL,
