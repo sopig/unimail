@@ -100,7 +100,7 @@ class UniMailServer:
                 ),
                 Tool(
                     name="mail_send",
-                    description="发送邮件。支持指定发件账号、附件、Markdown正文（自动转HTML）。",
+                    description="发送邮件。支持指定发件账号、附件、Markdown正文（自动转HTML），或使用模板。",
                     inputSchema={
                         "type": "object",
                         "properties": {
@@ -112,7 +112,8 @@ class UniMailServer:
                             "subject": {"type": "string", "description": "邮件主题"},
                             "body": {
                                 "type": "string",
-                                "description": "邮件正文（Markdown格式，自动转HTML）",
+                                "description": "邮件正文（Markdown格式，自动转HTML）。使用模板时可留空。",
+                                "default": "",
                             },
                             "from": {
                                 "type": "string",
@@ -133,8 +134,16 @@ class UniMailServer:
                                 "items": {"type": "string"},
                                 "description": "附件本地文件路径列表",
                             },
+                            "template": {
+                                "type": "string",
+                                "description": "邮件模板名称（如 welcome.html），使用后 body 作为纯文本 fallback",
+                            },
+                            "template_context": {
+                                "type": "object",
+                                "description": "模板渲染变量",
+                            },
                         },
-                        "required": ["to", "subject", "body"],
+                        "required": ["to", "subject"],
                     },
                 ),
                 Tool(
@@ -267,11 +276,13 @@ class UniMailServer:
             result = await self.engine.send_message(
                 to=args["to"],
                 subject=args["subject"],
-                body=args["body"],
+                body=args.get("body", ""),
                 from_=args.get("from"),
                 cc=args.get("cc"),
                 bcc=args.get("bcc"),
                 attachments=args.get("attachments"),
+                template=args.get("template"),
+                template_context=args.get("template_context"),
             )
             return f"✅ 邮件已发送\nFrom: {result['from']}\nTo: {', '.join(result['to'])}\nSubject: {result['subject']}"
 

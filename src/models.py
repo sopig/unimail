@@ -114,8 +114,16 @@ class MailSendInput(BaseModel):
     bcc: list[str] = []
     subject: str
     body: str  # Markdown format
+    template: Optional[str] = None  # Template name (overrides body)
+    template_context: Optional[dict] = None  # Context variables for template
     attachments: list[str] = []  # local file paths
     reply_to_message_id: Optional[str] = None
+
+
+class RateLimitConfig(BaseModel):
+    """Rate limit configuration per account."""
+    default_daily: int = 50
+    account_overrides: dict[str, int] = {}  # account_id -> daily limit
 
 
 class MailSearchInput(BaseModel):

@@ -6,6 +6,7 @@ import asyncio
 import email
 import email.utils
 import email.policy
+import time
 from datetime import datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -19,6 +20,8 @@ import aiosmtplib
 from aioimaplib import aioimaplib
 
 from .base import MailConnector
+from ..config import get_config
+from ..log import get_logger
 from ..models import (
     Attachment,
     Contact,
@@ -28,37 +31,106 @@ from ..models import (
     UnifiedMessage,
 )
 
+logger = get_logger(__name__)
+
 
 class ImapSmtpConnector(MailConnector):
     """
     Connector for any IMAP/SMTP-compatible mail server.
     Works with 163, QQ, 126, Yahoo, and generic providers.
+
+    Supports connection pooling with keep-alive and automatic reconnection.
     """
 
     def __init__(self, account: MailAccount, password: str):
         super().__init__(account)
         self.config: ImapConfig = account.config  # type: ignore
         self.password = password
-        self.imap: Optional[aioimaplib.IMAP4_SSL] = None
+        self._connection: Optional[aioimaplib.IMAP4_SSL] = None
+        self._last_activity: float = 0.0
+        self._connection_timeout: int = get_config().imap.connection_timeout
+
+    @property
+    def is_connected(self) -> bool:
+        """Check if the IMAP connection is alive and not timed out."""
+        if self._connection is None:
+            return False
+        # Check if connection has timed out due to inactivity
+        if self._last_activity > 0:
+            elapsed = time.time() - self._last_activity
+            if elapsed > self._connection_timeout:
+                logger.debug(
+                    f"Connection timed out ({elapsed:.0f}s > {self._connection_timeout}s)",
+                    extra={"account_id": self.account.id},
+                )
+                return False
+        return True
+
+    @property
+    def imap(self) -> Optional[aioimaplib.IMAP4_SSL]:
+        """Legacy accessor for backward compatibility."""
+        return self._connection
 
     async def connect(self) -> None:
-        """Connect to IMAP server."""
-        self.imap = aioimaplib.IMAP4_SSL(
+        """Connect to IMAP server, reusing existing connection if alive."""
+        if self.is_connected:
+            logger.debug(
+                "Reusing existing IMAP connection",
+                extra={"account_id": self.account.id},
+            )
+            self._last_activity = time.time()
+            return
+
+        # Close stale connection if any
+        if self._connection is not None:
+            logger.debug(
+                "Closing stale connection before reconnect",
+                extra={"account_id": self.account.id},
+            )
+            try:
+                await self._connection.logout()
+            except Exception:
+                pass
+            self._connection = None
+
+        logger.info(
+            f"Connecting to IMAP server {self.config.imap_host}:{self.config.imap_port}",
+            extra={"account_id": self.account.id, "connector": "imap"},
+        )
+
+        self._connection = aioimaplib.IMAP4_SSL(
             host=self.config.imap_host,
             port=self.config.imap_port,
         )
-        await self.imap.wait_hello_from_server()
-        await self.imap.login(self.config.username, self.password)
-        await self.imap.select("INBOX")
+        await self._connection.wait_hello_from_server()
+        await self._connection.login(self.config.username, self.password)
+        await self._connection.select("INBOX")
+        self._last_activity = time.time()
+
+        logger.info(
+            f"Connected to {self.config.imap_host}",
+            extra={"account_id": self.account.id, "connector": "imap"},
+        )
+
+    async def _ensure_connected(self) -> None:
+        """Ensure connection is alive, reconnecting if necessary."""
+        if not self.is_connected:
+            await self.connect()
+        self._last_activity = time.time()
 
     async def disconnect(self) -> None:
         """Disconnect from IMAP."""
-        if self.imap:
+        if self._connection:
+            logger.info(
+                "Disconnecting from IMAP",
+                extra={"account_id": self.account.id, "connector": "imap"},
+            )
             try:
-                await self.imap.logout()
+                await self._connection.logout()
             except Exception:
                 pass
-            self.imap = None
+            self._connection = None
+            self._last_activity = 0.0
 
     async def list_messages(
         self,
@@ -68,11 +140,12 @@ class ImapSmtpConnector(MailConnector):
         since: Optional[str] = None,
     ) -> list[UnifiedMessage]:
         """List messages via IMAP SEARCH + FETCH."""
-        assert self.imap is not None
+        await self._ensure_connected()
+        assert self._connection is not None
 
         # Select folder
         folder_name = self._map_folder(folder)
-        await self.imap.select(folder_name)
+        await self._connection.select(folder_name)
 
         # Build search criteria
         criteria = "ALL"
@@ -84,7 +157,7 @@ class ImapSmtpConnector(MailConnector):
             criteria += f' SINCE {dt.strftime("%d-%b-%Y")}'
 
         # Search
-        status, data = await self.imap.search(criteria)
+        status, data = await self._connection.search(criteria)
         if status != "OK":
             return []
 
@@ -98,7 +171,7 @@ class ImapSmtpConnector(MailConnector):
         # Fetch headers for these UIDs
         messages = []
         uid_str = ",".join(u.decode() if isinstance(u, bytes) else u for u in uids)
-        status, fetch_data = await self.imap.fetch(
+        status, fetch_data = await self._connection.fetch(
             uid_str, "(UID FLAGS ENVELOPE BODYSTRUCTURE RFC822.SIZE)"
         )
 
@@ -108,13 +181,15 @@ class ImapSmtpConnector(MailConnector):
                 if msg:
                     messages.append(msg)
 
+        self._last_activity = time.time()
         return messages
 
     async def get_message(self, external_id: str) -> UnifiedMessage:
         """Fetch full message by UID."""
-        assert self.imap is not None
+        await self._ensure_connected()
+        assert self._connection is not None
 
-        status, data = await self.imap.fetch(external_id, "(RFC822 FLAGS)")
+        status, data = await self._connection.fetch(external_id, "(RFC822 FLAGS)")
         if status != "OK" or not data:
             raise ValueError(f"Message {external_id} not found")
 
@@ -127,6 +202,7 @@ class ImapSmtpConnector(MailConnector):
         else:
             msg = email.message_from_string(raw_email, policy=email.policy.default)
 
+        self._last_activity = time.time()
         return self._parse_full_email(msg, external_id)
 
     async def send_message(
@@ -180,6 +256,11 @@ class ImapSmtpConnector(MailConnector):
             all_recipients.extend(bcc)
 
         # Send via SMTP
+        logger.info(
+            f"Sending email to {to} via SMTP {self.config.smtp_host}",
+            extra={"account_id": self.account.id, "action": "send"},
+        )
+
         await aiosmtplib.send(
             msg,
             hostname=self.config.smtp_host,
@@ -193,35 +274,44 @@ class ImapSmtpConnector(MailConnector):
         return msg["Message-ID"]
 
     async def mark_read(self, external_id: str) -> None:
-        assert self.imap is not None
-        await self.imap.store(external_id, "+FLAGS", r"(\Seen)")
+        await self._ensure_connected()
+        assert self._connection is not None
+        await self._connection.store(external_id, "+FLAGS", r"(\Seen)")
+        self._last_activity = time.time()
 
     async def mark_unread(self, external_id: str) -> None:
-        assert self.imap is not None
-        await self.imap.store(external_id, "-FLAGS", r"(\Seen)")
+        await self._ensure_connected()
+        assert self._connection is not None
+        await self._connection.store(external_id, "-FLAGS", r"(\Seen)")
+        self._last_activity = time.time()
 
     async def archive(self, external_id: str) -> None:
         """Move to Archive folder (or All Mail for Gmail-like)."""
-        assert self.imap is not None
+        await self._ensure_connected()
+        assert self._connection is not None
         # Try common archive folder names
         for folder in ["Archive", "All Mail", "&Xstrg1LZFw-"]:  # 163 uses special encoding
             try:
-                await self.imap.copy(external_id, folder)
-                await self.imap.store(external_id, "+FLAGS", r"(\Deleted)")
-                await self.imap.expunge()
+                await self._connection.copy(external_id, folder)
+                await self._connection.store(external_id, "+FLAGS", r"(\Deleted)")
+                await self._connection.expunge()
+                self._last_activity = time.time()
                 return
             except Exception:
                 continue
         # Fallback: just remove from inbox (mark deleted)
-        await self.imap.store(external_id, "+FLAGS", r"(\Deleted)")
+        await self._connection.store(external_id, "+FLAGS", r"(\Deleted)")
+        self._last_activity = time.time()
 
     async def trash(self, external_id: str) -> None:
-        assert self.imap is not None
+        await self._ensure_connected()
+        assert self._connection is not None
         for folder in ["Trash", "&XfJT0ZAB-", "Deleted Messages"]:
             try:
-                await self.imap.copy(external_id, folder)
-                await self.imap.store(external_id, "+FLAGS", r"(\Deleted)")
-                await self.imap.expunge()
+                await self._connection.copy(external_id, folder)
+                await self._connection.store(external_id, "+FLAGS", r"(\Deleted)")
+                await self._connection.expunge()
+                self._last_activity = time.time()
                 return
             except Exception:
                 continue
@@ -235,7 +325,8 @@ class ImapSmtpConnector(MailConnector):
         limit: int = 10,
     ) -> list[UnifiedMessage]:
         """Search via IMAP SEARCH command."""
-        assert self.imap is not None
+        await self._ensure_connected()
+        assert self._connection is not None
 
         criteria_parts = []
         if query:
@@ -251,7 +342,7 @@ class ImapSmtpConnector(MailConnector):
 
         criteria = " ".join(criteria_parts) if criteria_parts else "ALL"
 
-        status, data = await self.imap.search(criteria)
+        status, data = await self._connection.search(criteria)
         if status != "OK":
             return []
 
@@ -266,15 +357,17 @@ class ImapSmtpConnector(MailConnector):
             except Exception:
                 continue
 
+        self._last_activity = time.time()
         return messages
 
     async def download_attachment(
         self, message_id: str, attachment_id: str
     ) -> tuple[bytes, str]:
         """Download attachment by fetching the full message and extracting the part."""
-        assert self.imap is not None
+        await self._ensure_connected()
+        assert self._connection is not None
 
-        status, data = await self.imap.fetch(message_id, "(RFC822)")
+        status, data = await self._connection.fetch(message_id, "(RFC822)")
         if status != "OK":
             raise ValueError(f"Message {message_id} not found")
 
@@ -295,12 +388,13 @@ class ImapSmtpConnector(MailConnector):
 
     async def sync_incremental(self) -> list[UnifiedMessage]:
         """Fetch messages newer than last known UID."""
-        assert self.imap is not None
+        await self._ensure_connected()
+        assert self._connection is not None
 
         last_uid = self.account.sync_state.imap_last_uid or 0
-        
+
         # Search for UIDs > last_uid
-        status, data = await self.imap.search(f"UID {last_uid + 1}:*")
+        status, data = await self._connection.search(f"UID {last_uid + 1}:*")
         if status != "OK":
             return []
 
@@ -323,6 +417,7 @@ class ImapSmtpConnector(MailConnector):
             except Exception:
                 continue
 
+        self._last_activity = time.time()
         return messages
 
     # === Helpers ===
