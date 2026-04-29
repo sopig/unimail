@@ -611,8 +611,9 @@ async def _run_all(passphrase: str, port: int):
 
     # 创建 MCP Server（使用共享 engine）
     mail_server = UniMailServer(passphrase)
-    # 替换 MCP server 的 engine 为共享实例
+    # 替换 MCP server 的 engine 和 db 为共享实例
     mail_server.engine = engine
+    mail_server.db = db
 
     # 创建 REST API（使用共享 engine）
     app = create_app(passphrase, engine=engine)

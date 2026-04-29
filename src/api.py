@@ -234,9 +234,18 @@ def create_app(
     # === 辅助函数 ===
 
     def get_engine(request: Request) -> MailEngine:
+        if not hasattr(request.app.state, "engine"):
+            # Fallback: lifespan 未触发时（如测试环境），同步初始化
+            db = Database(data_dir / "unimail.db")
+            token_store = TokenStore(data_dir / "tokens.enc", passphrase)
+            eng = MailEngine(db, token_store)
+            request.app.state.engine = eng
+            request.app.state.db = db
         return request.app.state.engine
 
     def get_db(request: Request) -> Database:
+        if not hasattr(request.app.state, "db"):
+            get_engine(request)  # triggers init
         return request.app.state.db
 
     # === 路由 ===
