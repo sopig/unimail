@@ -289,13 +289,122 @@ unimail schema mcp
                 Gmail          Outlook      163/QQ/Yahoo
 ```
 
+## Configuration
+
+UniMail uses a layered configuration system: **Environment Variables > config.toml > Defaults**.
+
+Create `~/.unimail/config.toml`:
+
+```toml
+[server]
+port = 8765
+mode = "all"  # mcp | api | all
+
+[security]
+api_token = ""       # Simple Bearer token
+jwt_secret = ""      # Set to enable JWT auth (HS256)
+jwt_expire_hours = 24
+
+[rate_limit]
+default_daily = 50   # Max sends per account per day
+
+[cache]
+enabled = true
+inbox_ttl = 60       # Cache inbox for 60 seconds
+message_ttl = 300    # Cache message details for 5 minutes
+
+[imap]
+connection_timeout = 30
+keepalive = true     # Reuse IMAP connections
+
+[logging]
+level = "INFO"       # DEBUG | INFO | WARNING | ERROR
+format = "json"      # json | console
+
+# Webhooks for new mail notifications
+[[webhooks]]
+id = "my-hook"
+url = "https://your-server.com/webhook/mail"
+events = ["new_message"]
+```
+
+All settings can be overridden via environment variables: `UNIMAIL_PORT`, `UNIMAIL_JWT_SECRET`, `UNIMAIL_LOG_LEVEL`, etc.
+
 ## Security
 
 - **Token encryption**: All OAuth tokens and passwords encrypted with Fernet (PBKDF2 key derivation)
-- **Send limits**: Default 50 emails/day per account
+- **JWT authentication**: Optional HS256 JWT with configurable expiry and scopes (read/write/admin)
+- **Dual auth mode**: JWT preferred + simple Bearer token fallback
+- **Send limits**: Configurable daily limit per account (default 50/day, persisted in SQLite)
 - **Audit log**: Every send operation logged to SQLite
 - **Minimal permissions**: Only `mail.modify` + `mail.send` scopes requested
 - **Local-first**: No data leaves your machine
+
+### JWT Authentication
+
+```bash
+# Enable JWT
+export UNIMAIL_JWT_SECRET="your-32-byte-secret-minimum"
+
+# Generate a token
+curl -X POST http://localhost:8765/api/auth/token \
+  -H "Content-Type: application/json" \
+  -d '{"passphrase": "your-unimail-passphrase", "scope": "read write"}'
+
+# Use the token
+curl -H "Authorization: Bearer <jwt-token>" http://localhost:8765/api/mail
+```
+
+## Performance
+
+- **IMAP Connection Pool**: Persistent connections with keepalive, auto-reconnect on timeout
+- **In-memory LRU Cache**: Thread-safe TTL cache for inbox (60s) and message details (300s)
+- **Cache invalidation**: Automatic on send/archive, manual via `cache.invalidate(account)`
+- **FTS5 Full-text Search**: SQLite native full-text search for fast local queries
+
+## Webhooks
+
+Register webhook URLs to receive POST notifications when new emails arrive:
+
+```toml
+# In config.toml
+[[webhooks]]
+id = "slack-notify"
+url = "https://hooks.slack.com/services/xxx"
+events = ["new_message"]
+```
+
+Or via API:
+```bash
+# Register
+curl -X POST http://localhost:8765/api/webhooks \
+  -H "Content-Type: application/json" \
+  -d '{"url": "https://your-server.com/hook", "events": ["new_message"]}'
+
+# List
+curl http://localhost:8765/api/webhooks
+
+# Delete
+curl -X DELETE http://localhost:8765/api/webhooks/slack-notify
+```
+
+Webhooks include 3x retry with exponential backoff.
+
+## Email Templates
+
+Jinja2-based email templates stored in `~/.unimail/templates/`:
+
+```bash
+# List available templates
+curl http://localhost:8765/api/templates
+
+# Send with template
+curl -X POST http://localhost:8765/api/mail/send \
+  -H "Content-Type: application/json" \
+  -d '{"to": ["user@example.com"], "subject": "Welcome!", "template": "welcome", "template_context": {"name": "Alice", "company": "Acme"}}'
+```
+
+Built-in templates: `welcome`, `notification`, `reply`. Add custom `.html` files to `~/.unimail/templates/`.
 
 ## OAuth Setup
 
@@ -329,21 +438,27 @@ unimail schema mcp
 unimail/
 ├── src/
 │   ├── models.py          # Core data models (Pydantic)
+│   ├── config.py          # Configuration system (TOML + env)
+│   ├── log.py             # Structured logging (JSON/console)
+│   ├── cache.py           # TTL LRU cache
+│   ├── webhook.py         # Webhook push notifications
+│   ├── templates.py       # Jinja2 email templates
 │   ├── server.py          # MCP Server (tools registration)
-│   ├── api.py             # REST API (FastAPI)
+│   ├── api.py             # REST API (FastAPI + JWT)
+│   ├── client.py          # High-level Python SDK
 │   ├── schemas/           # Schema exports for various formats
 │   │   └── openai_functions.py  # OpenAI function calling TOOLS + dispatch
 │   ├── integrations/      # Framework-specific wrappers
 │   │   └── langchain_tools.py   # LangChain @tool wrappers
 │   ├── connectors/        # Provider-specific connectors
 │   │   ├── base.py        # Abstract interface
-│   │   ├── gmail_connector.py
-│   │   ├── outlook_connector.py
-│   │   └── imap_connector.py
+│   │   ├── gmail_connector.py   # Gmail REST API (connection pool)
+│   │   ├── outlook_connector.py # Microsoft Graph API
+│   │   └── imap_connector.py    # IMAP/SMTP (keepalive pool)
 │   ├── engine/            # Core business logic
-│   │   └── mail_engine.py # Orchestrator
+│   │   └── mail_engine.py # Orchestrator (rate limit + cache)
 │   ├── storage/           # Persistence layer
-│   │   ├── database.py    # SQLite (cache + metadata)
+│   │   ├── database.py    # SQLite (cache + FTS5 + rate limit)
 │   │   └── token_store.py # Encrypted token storage
 │   ├── auth/              # OAuth flows
 │   │   ├── oauth_flow.py  # Local callback server
@@ -351,6 +466,14 @@ unimail/
 │   │   └── outlook_auth.py
 │   └── cli/               # CLI commands
 │       └── main.py
+├── tests/                 # pytest test suite (60+ tests)
+│   ├── conftest.py        # Shared fixtures
+│   ├── test_models.py
+│   ├── test_storage.py
+│   ├── test_engine.py
+│   ├── test_api.py
+│   ├── test_cli.py
+│   └── test_schemas.py
 ├── agent-configs/         # Ready-to-use configs for each agent
 │   ├── claude-code.json
 │   ├── cursor-mcp.json
@@ -366,7 +489,17 @@ unimail/
 
 ```bash
 pip install -e ".[dev]"
-pytest tests/
+
+# Run tests
+pytest tests/ -v
+
+# Run with coverage
+pytest tests/ --cov=src --cov-report=term-missing
+
+# Type checking
+mypy src/ --ignore-missing-imports
+
+# Linting
 ruff check src/
 ```
 
