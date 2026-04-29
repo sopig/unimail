@@ -16,6 +16,9 @@ dependencies = [
     # IMAP/SMTP
     "aioimaplib>=1.1.0",
     "aiosmtplib>=3.0.0",
+    # REST API
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.30.0",
     # Utilities
     "markdown>=3.5",
     "cryptography>=42.0.0",

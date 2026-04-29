@@ -11,6 +11,16 @@ A self-hosted MCP (Model Context Protocol) server that gives AI agents the abili
 - **CLI**: Simple account management from the command line
 - **Local-first**: SQLite cache, no cloud dependency, full data ownership
 
+## Access Methods
+
+UniMail provides **three** parallel access methods:
+
+| Method | Use Case | Protocol |
+|--------|----------|----------|
+| **MCP Server** | AI agent integration (Claude, OpenClaw) | MCP over stdio |
+| **REST API** | Web apps, scripts, any HTTP client | HTTP/JSON |
+| **CLI** | Terminal power users, quick operations | Command line |
+
 ## Quick Start
 
 ### 1. Install
@@ -46,11 +56,17 @@ unimail test your@163.com
 unimail list
 ```
 
-### 4. Run MCP Server
+### 4. Start Server
 
 ```bash
-# stdio (recommended for OpenClaw integration)
-unimail serve
+# MCP Server (stdio, recommended for AI agent integration)
+unimail serve --mode mcp
+
+# REST API server
+unimail serve --mode api --port 8765
+
+# Both MCP + REST API simultaneously
+unimail serve --mode all --port 8765
 
 # Or manually test sync
 unimail sync
@@ -85,17 +101,110 @@ Add to your OpenClaw MCP config:
 | `mail_archive` | 归档/删除邮件 |
 | `mail_attachment` | 下载附件 |
 
+## REST API
+
+Start the API server:
+
+```bash
+unimail serve --mode api --port 8765
+```
+
+API docs are auto-generated at `http://localhost:8765/docs` (Swagger UI).
+
+### Authentication
+
+Set `UNIMAIL_API_TOKEN` environment variable to enable Bearer token authentication:
+
+```bash
+export UNIMAIL_API_TOKEN=your-secret-token
+```
+
+If not set, the API is unauthenticated (suitable for local use).
+
+### Endpoints
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/api/mail` | 查看邮件列表（?folder=inbox&limit=20&unread_only=false&account=xxx） |
+| `GET` | `/api/mail/{message_id}` | 读取邮件详情 |
+| `POST` | `/api/mail/send` | 发送邮件 |
+| `POST` | `/api/mail/{message_id}/reply` | 回复邮件 |
+| `GET` | `/api/mail/search?q=keyword` | 搜索邮件 |
+| `GET` | `/api/accounts` | 查看已连接账户 |
+| `POST` | `/api/mail/{message_id}/archive` | 归档邮件 |
+| `GET` | `/api/mail/{message_id}/attachments/{filename}` | 下载附件 |
+
+### Examples
+
+```bash
+# List inbox
+curl http://localhost:8765/api/mail
+
+# Read a message
+curl http://localhost:8765/api/mail/gmail_abc123
+
+# Send an email
+curl -X POST http://localhost:8765/api/mail/send \
+  -H "Content-Type: application/json" \
+  -d '{"to": ["user@example.com"], "subject": "Hello", "body": "# Hi\n\nThis is **markdown**."}'
+
+# Search
+curl "http://localhost:8765/api/mail/search?q=invoice"
+
+# With auth token
+curl -H "Authorization: Bearer your-secret-token" http://localhost:8765/api/mail
+```
+
+## CLI Mail Operations
+
+Beyond account management, UniMail CLI provides direct mail operations:
+
+```bash
+# View inbox
+unimail inbox
+unimail inbox --limit 5 --unread
+unimail inbox --account your@163.com
+
+# Read a message
+unimail read <message_id>
+
+# Send an email
+unimail send user@example.com --subject "Hello" --body "Message body"
+unimail send user@example.com -s "With CC" -b "Body" --cc other@example.com
+unimail send user@example.com -s "Files" -b "See attached" --attachment /path/to/file.pdf
+
+# Reply to a message
+unimail reply <message_id> --body "Thanks!"
+unimail reply <message_id> -b "Got it" --reply-all
+
+# Search emails
+unimail search "invoice"
+unimail search "meeting" --account your@gmail.com --limit 5
+```
+
 ## Architecture
 
 ```
-AI Agent ←→ MCP Protocol ←→ UniMail Server
+                   ┌─────────────────────────────┐
+                   │       Access Methods         │
+                   ├──────────┬──────────┬────────┤
+                   │ MCP      │ REST API │  CLI   │
+                   │ (stdio)  │ (HTTP)   │(click) │
+                   └────┬─────┴────┬─────┴───┬────┘
+                        │          │         │
+                        └──────────┼─────────┘
                                    │
-                    ┌───────────────┼───────────────┐
-                    │               │               │
-              Gmail API      Graph API        IMAP/SMTP
-              (OAuth2)       (OAuth2)         (AuthCode)
-                    │               │               │
-                Gmail          Outlook        163/QQ/Yahoo
+                           ┌───────┴────────┐
+                           │  Mail Engine   │
+                           │ (core logic)   │
+                           └───────┬────────┘
+                                   │
+                    ┌──────────────┼──────────────┐
+                    │              │              │
+              Gmail API     Graph API      IMAP/SMTP
+              (OAuth2)      (OAuth2)       (AuthCode)
+                    │              │              │
+                Gmail          Outlook      163/QQ/Yahoo
 ```
 
 ## Security
@@ -139,6 +248,7 @@ unimail/
 ├── src/
 │   ├── models.py          # Core data models (Pydantic)
 │   ├── server.py          # MCP Server (tools registration)
+│   ├── api.py             # REST API (FastAPI)
 │   ├── connectors/        # Provider-specific connectors
 │   │   ├── base.py        # Abstract interface
 │   │   ├── gmail_connector.py

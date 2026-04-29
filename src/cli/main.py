@@ -1,14 +1,18 @@
-"""UniMail CLI - Account management and server control."""
+"""UniMail CLI - Account management, mail operations, and server control."""
 
 from __future__ import annotations
 
 import asyncio
 import uuid
 from pathlib import Path
+from typing import Optional
 
 import click
 from rich.console import Console
+from rich.panel import Panel
 from rich.table import Table
+from rich.text import Text
+from rich.markdown import Markdown
 
 from ..models import (
     GmailConfig,
@@ -35,6 +39,19 @@ def get_db() -> Database:
 def get_token_store(passphrase: str = "unimail-default") -> TokenStore:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     return TokenStore(DATA_DIR / "tokens.enc", passphrase)
+
+
+def _run_async(coro):
+    """包装异步协程为同步调用。"""
+    return asyncio.run(coro)
+
+
+def _get_engine(passphrase: str):
+    """创建并返回 MailEngine 实例。"""
+    from ..engine.mail_engine import MailEngine
+    db = get_db()
+    token_store = get_token_store(passphrase)
+    return MailEngine(db, token_store)
 
 
 @click.group()
@@ -196,7 +213,7 @@ def add_imap(ctx, email: str, password: str, imap_host: str, imap_port: int,
     # Test connection
     console.print(f"[dim]Testing connection to {imap_host}:{imap_port}...[/dim]")
     try:
-        asyncio.run(_test_imap_connection(account, password))
+        _run_async(_test_imap_connection(account, password))
     except Exception as e:
         console.print(f"[red]Connection failed: {e}[/red]")
         if not click.confirm("Save anyway?"):
@@ -292,26 +309,332 @@ def set_default(email: str):
     console.print(f"[green]✅ Default account set: {email}[/green]")
 
 
+# ========== Mail Operations (NEW) ==========
+
+
+@cli.command("inbox")
+@click.option("--limit", "-n", default=20, help="返回数量")
+@click.option("--unread", "-u", is_flag=True, help="只看未读")
+@click.option("--account", "-a", default=None, help="指定邮箱账户")
+@click.pass_context
+def inbox(ctx, limit: int, unread: bool, account: Optional[str]):
+    """📥 查看收件箱。"""
+    passphrase = ctx.obj["passphrase"]
+
+    async def _inbox():
+        engine = _get_engine(passphrase)
+        await engine.initialize()
+        try:
+            messages = await engine.list_messages(
+                account=account,
+                folder="inbox",
+                limit=limit,
+                unread_only=unread,
+            )
+            return messages
+        finally:
+            await engine.shutdown()
+
+    try:
+        messages = _run_async(_inbox())
+    except Exception as e:
+        console.print(f"[red]❌ Error: {e}[/red]")
+        return
+
+    if not messages:
+        console.print("[dim]📭 收件箱为空[/dim]")
+        return
+
+    table = Table(title=f"📥 收件箱 ({len(messages)} 封)")
+    table.add_column("", width=2)
+    table.add_column("#", style="dim", width=3)
+    table.add_column("时间", style="cyan", width=12)
+    table.add_column("发件人", style="green", max_width=25)
+    table.add_column("主题", max_width=50)
+    table.add_column("ID", style="dim", max_width=20)
+
+    for i, msg in enumerate(messages, 1):
+        read_icon = "" if msg.is_read else "🔵"
+        att_icon = " 📎" if msg.attachments else ""
+        time_str = msg.received_at.strftime("%m-%d %H:%M")
+        from_str = msg.from_contact.name or msg.from_contact.email
+        subject = msg.subject + att_icon
+        table.add_row(read_icon, str(i), time_str, from_str, subject, msg.id[:16] + "...")
+
+    console.print(table)
+
+
+@cli.command("read")
+@click.argument("message_id")
+@click.pass_context
+def read_mail(ctx, message_id: str):
+    """📖 读取邮件详情。"""
+    passphrase = ctx.obj["passphrase"]
+
+    async def _read():
+        engine = _get_engine(passphrase)
+        await engine.initialize()
+        try:
+            msg = await engine.get_message(message_id)
+            await engine.mark_read(message_id)
+            return msg
+        finally:
+            await engine.shutdown()
+
+    try:
+        msg = _run_async(_read())
+    except Exception as e:
+        console.print(f"[red]❌ Error: {e}[/red]")
+        return
+
+    # 构建邮件头部
+    header_lines = []
+    from_str = f"{msg.from_contact.name or ''} <{msg.from_contact.email}>"
+    header_lines.append(f"[bold]From:[/bold]    {from_str}")
+    header_lines.append(f"[bold]To:[/bold]      {', '.join(c.email for c in msg.to)}")
+    if msg.cc:
+        header_lines.append(f"[bold]Cc:[/bold]      {', '.join(c.email for c in msg.cc)}")
+    header_lines.append(f"[bold]Subject:[/bold] {msg.subject}")
+    header_lines.append(f"[bold]Date:[/bold]    {msg.received_at.strftime('%Y-%m-%d %H:%M:%S')}")
+    header_lines.append(f"[bold]ID:[/bold]      {msg.id}")
+
+    console.print(Panel(
+        "\n".join(header_lines),
+        title="📧 邮件详情",
+        border_style="blue",
+    ))
+
+    # 正文
+    body = msg.body_text or "(HTML only - 无文本内容)"
+    console.print(Panel(body, title="正文", border_style="dim"))
+
+    # 附件
+    if msg.attachments:
+        att_table = Table(title="📎 附件")
+        att_table.add_column("文件名", style="cyan")
+        att_table.add_column("大小", style="green")
+        att_table.add_column("ID", style="dim")
+        for att in msg.attachments:
+            size_str = f"{att.size / 1024:.1f} KB"
+            att_table.add_row(att.filename, size_str, att.id)
+        console.print(att_table)
+
+
+@cli.command("send")
+@click.argument("to")
+@click.option("--subject", "-s", required=True, help="邮件主题")
+@click.option("--body", "-b", required=True, help="邮件正文（Markdown 格式）")
+@click.option("--cc", default=None, help="抄送，多个用逗号分隔")
+@click.option("--account", "-a", default=None, help="发件邮箱")
+@click.option("--attachment", multiple=True, help="附件路径（可多次指定）")
+@click.pass_context
+def send_mail(ctx, to: str, subject: str, body: str, cc: Optional[str],
+              account: Optional[str], attachment: tuple):
+    """✉️ 发送邮件。"""
+    passphrase = ctx.obj["passphrase"]
+
+    # 解析收件人和抄送
+    to_list = [addr.strip() for addr in to.split(",")]
+    cc_list = [addr.strip() for addr in cc.split(",")] if cc else None
+    att_list = list(attachment) if attachment else None
+
+    async def _send():
+        engine = _get_engine(passphrase)
+        await engine.initialize()
+        try:
+            result = await engine.send_message(
+                to=to_list,
+                subject=subject,
+                body=body,
+                from_=account,
+                cc=cc_list,
+                attachments=att_list,
+            )
+            return result
+        finally:
+            await engine.shutdown()
+
+    try:
+        result = _run_async(_send())
+    except Exception as e:
+        console.print(f"[red]❌ 发送失败: {e}[/red]")
+        return
+
+    console.print(Panel(
+        f"[bold]From:[/bold]    {result['from']}\n"
+        f"[bold]To:[/bold]      {', '.join(result['to'])}\n"
+        f"[bold]Subject:[/bold] {result['subject']}",
+        title="[green]✅ 邮件已发送[/green]",
+        border_style="green",
+    ))
+
+
+@cli.command("reply")
+@click.argument("message_id")
+@click.option("--body", "-b", required=True, help="回复内容（Markdown）")
+@click.option("--reply-all", is_flag=True, help="回复所有人")
+@click.pass_context
+def reply_mail(ctx, message_id: str, body: str, reply_all: bool):
+    """↩️ 回复邮件。"""
+    passphrase = ctx.obj["passphrase"]
+
+    async def _reply():
+        engine = _get_engine(passphrase)
+        await engine.initialize()
+        try:
+            result = await engine.reply_message(
+                message_id=message_id,
+                body=body,
+                reply_all=reply_all,
+            )
+            return result
+        finally:
+            await engine.shutdown()
+
+    try:
+        result = _run_async(_reply())
+    except Exception as e:
+        console.print(f"[red]❌ 回复失败: {e}[/red]")
+        return
+
+    console.print(Panel(
+        f"[bold]From:[/bold] {result['from']}\n"
+        f"[bold]To:[/bold]   {', '.join(result['to'])}",
+        title="[green]✅ 回复已发送[/green]",
+        border_style="green",
+    ))
+
+
+@cli.command("search")
+@click.argument("query")
+@click.option("--account", "-a", default=None, help="限定搜索的账户")
+@click.option("--limit", "-n", default=10, help="返回数量")
+@click.pass_context
+def search_mail(ctx, query: str, account: Optional[str], limit: int):
+    """🔍 搜索邮件。"""
+    passphrase = ctx.obj["passphrase"]
+
+    async def _search():
+        engine = _get_engine(passphrase)
+        await engine.initialize()
+        try:
+            messages = await engine.search_messages(
+                query=query,
+                account=account,
+                limit=limit,
+            )
+            return messages
+        finally:
+            await engine.shutdown()
+
+    try:
+        messages = _run_async(_search())
+    except Exception as e:
+        console.print(f"[red]❌ Error: {e}[/red]")
+        return
+
+    if not messages:
+        console.print(f"[dim]🔍 未找到匹配「{query}」的邮件[/dim]")
+        return
+
+    table = Table(title=f"🔍 搜索结果: \"{query}\" ({len(messages)} 封)")
+    table.add_column("#", style="dim", width=3)
+    table.add_column("时间", style="cyan", width=12)
+    table.add_column("发件人", style="green", max_width=25)
+    table.add_column("主题", max_width=50)
+    table.add_column("ID", style="dim", max_width=20)
+
+    for i, msg in enumerate(messages, 1):
+        time_str = msg.received_at.strftime("%m-%d %H:%M")
+        from_str = msg.from_contact.name or msg.from_contact.email
+        table.add_row(str(i), time_str, from_str, msg.subject, msg.id[:16] + "...")
+
+    console.print(table)
+
+
 # ========== Server ==========
 
 
 @cli.command("serve")
-@click.option("--transport", type=click.Choice(["stdio", "sse"]), default="stdio")
-@click.option("--port", type=int, default=3100, help="Port for SSE transport")
+@click.option("--mode", type=click.Choice(["mcp", "api", "all"]), default="mcp",
+              help="服务模式: mcp (MCP stdin), api (REST API), all (同时启动)")
+@click.option("--port", type=int, default=8765, help="REST API 端口")
+@click.option("--transport", type=click.Choice(["stdio", "sse"]), default="stdio",
+              help="MCP transport 类型（仅 mcp/all 模式）")
 @click.pass_context
-def serve(ctx, transport: str, port: int):
-    """Start MCP server."""
-    from ..server import run_server
-
+def serve(ctx, mode: str, port: int, transport: str):
+    """🚀 Start UniMail server."""
     passphrase = ctx.obj["passphrase"]
-    console.print(f"[bold]🚀 Starting UniMail MCP Server (transport: {transport})[/bold]")
 
-    if transport == "stdio":
-        asyncio.run(run_server(passphrase))
-    else:
-        console.print(f"[dim]SSE server on port {port}...[/dim]")
-        # TODO: SSE transport
-        asyncio.run(run_server(passphrase))
+    if mode == "mcp":
+        # 原有 MCP Server 行为
+        from ..server import run_server
+        console.print(f"[bold]🚀 Starting UniMail MCP Server (transport: {transport})[/bold]")
+        _run_async(run_server(passphrase))
+
+    elif mode == "api":
+        # 启动 REST API
+        import uvicorn
+        from ..api import create_app
+
+        console.print(f"[bold]🚀 Starting UniMail REST API on port {port}[/bold]")
+        console.print(f"[dim]API docs: http://localhost:{port}/docs[/dim]")
+
+        app = create_app(passphrase)
+        uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
+
+    elif mode == "all":
+        # 同时启动 MCP + REST API
+        console.print(
+            f"[bold]🚀 Starting UniMail (MCP + REST API on port {port})[/bold]"
+        )
+        console.print(f"[dim]API docs: http://localhost:{port}/docs[/dim]")
+        _run_async(_run_all(passphrase, port))
+
+
+async def _run_all(passphrase: str, port: int):
+    """同时运行 MCP Server (stdin) 和 REST API。"""
+    import uvicorn
+    from ..api import create_app
+    from ..engine.mail_engine import MailEngine
+    from ..server import UniMailServer
+    from ..storage.database import Database
+    from ..storage.token_store import TokenStore
+
+    # 共享 MailEngine
+    data_dir = DATA_DIR
+    data_dir.mkdir(parents=True, exist_ok=True)
+    db = Database(data_dir / "unimail.db")
+    token_store = TokenStore(data_dir / "tokens.enc", passphrase)
+    engine = MailEngine(db, token_store)
+    await engine.initialize()
+
+    # 创建 MCP Server（使用共享 engine）
+    mail_server = UniMailServer(passphrase)
+    # 替换 MCP server 的 engine 为共享实例
+    mail_server.engine = engine
+
+    # 创建 REST API（使用共享 engine）
+    app = create_app(passphrase, engine=engine)
+
+    # 启动 REST API（后台任务）
+    config = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="info")
+    server = uvicorn.Server(config)
+
+    # 并发运行 MCP + API
+    from mcp.server.stdio import stdio_server
+
+    async def run_mcp():
+        async with stdio_server() as (read_stream, write_stream):
+            await mail_server.server.run(read_stream, write_stream)
+
+    async def run_api():
+        await server.serve()
+
+    try:
+        await asyncio.gather(run_mcp(), run_api())
+    finally:
+        await engine.shutdown()
 
 
 # ========== Utility ==========
@@ -334,7 +657,7 @@ def sync(ctx):
         console.print(f"[green]✅ Synced {count} new messages[/green]")
         await engine.shutdown()
 
-    asyncio.run(_sync())
+    _run_async(_sync())
 
 
 @cli.command("test")
@@ -371,7 +694,7 @@ def test_connection(ctx, email: str):
         return messages
 
     try:
-        messages = asyncio.run(_test())
+        messages = _run_async(_test())
         console.print(f"[green]✅ Connected! Found {len(messages)} recent messages.[/green]")
         for msg in messages[:3]:
             console.print(f"  • {msg.subject[:50]}")
