@@ -161,25 +161,22 @@ class ImapSmtpConnector(MailConnector):
         if status != "OK":
             return []
 
-        # Get UIDs (most recent first)
-        uids = data[0].split()
-        uids = list(reversed(uids))[:limit]
+        # Get sequence numbers (most recent first)
+        seq_nums = data[0].split()
+        seq_nums = list(reversed(seq_nums))[:limit]
 
-        if not uids:
+        if not seq_nums:
             return []
 
-        # Fetch headers for these UIDs
+        # Fetch each message by RFC822 and parse with email module
         messages = []
-        uid_str = ",".join(u.decode() if isinstance(u, bytes) else u for u in uids)
-        status, fetch_data = await self._connection.fetch(
-            uid_str, "(UID FLAGS ENVELOPE BODYSTRUCTURE RFC822.SIZE)"
-        )
-
-        for i in range(0, len(fetch_data), 2):
-            if i < len(fetch_data):
-                msg = self._parse_fetch_response(fetch_data[i])
-                if msg:
-                    messages.append(msg)
+        for seq in seq_nums:
+            seq_str = seq.decode() if isinstance(seq, bytes) else seq
+            try:
+                msg = await self.get_message(seq_str)
+                messages.append(msg)
+            except Exception:
+                continue
 
         self._last_activity = time.time()
         return messages
@@ -193,14 +190,19 @@ class ImapSmtpConnector(MailConnector):
         if status != "OK" or not data:
             raise ValueError(f"Message {external_id} not found")
 
-        # Parse raw email
-        raw_email = data[0]
-        if isinstance(raw_email, tuple):
-            raw_email = raw_email[1]
-        if isinstance(raw_email, bytes):
-            msg = email.message_from_bytes(raw_email, policy=email.policy.default)
-        else:
-            msg = email.message_from_string(raw_email, policy=email.policy.default)
+        # Parse raw email — aioimaplib returns:
+        # [0] response line (bytes), [1] RFC822 body (bytearray), [2] ")" , [3] completion msg
+        raw_email = None
+        for item in data:
+            if isinstance(item, (bytes, bytearray)) and not isinstance(item, bytearray) == False:
+                # Skip small non-body items (response lines, closing parens)
+                if isinstance(item, bytearray) or (isinstance(item, bytes) and b"FETCH" not in item and len(item) > 100):
+                    raw_email = bytes(item) if isinstance(item, bytearray) else item
+                    break
+        if raw_email is None:
+            raise ValueError(f"Message {external_id} not found: no RFC822 data")
+
+        msg = email.message_from_bytes(raw_email, policy=email.policy.default)
 
         self._last_activity = time.time()
         return self._parse_full_email(msg, external_id)
@@ -433,19 +435,6 @@ class ImapSmtpConnector(MailConnector):
             "spam": "Spam",
         }
         return mapping.get(folder, folder)
-
-    def _parse_fetch_response(self, data) -> Optional[UnifiedMessage]:
-        """Parse IMAP FETCH response into UnifiedMessage (headers only)."""
-        # This is a simplified parser; real implementation would use
-        # the envelope data from FETCH response
-        try:
-            if isinstance(data, bytes):
-                data = data.decode("utf-8", errors="replace")
-            # ... parse envelope fields
-            # For now, return None (full implementation uses RFC822 parsing)
-            return None
-        except Exception:
-            return None
 
     def _parse_full_email(
         self, msg: email.message.Message, uid: str
