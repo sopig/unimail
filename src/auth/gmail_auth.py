@@ -12,7 +12,7 @@ GMAIL_SCOPES = [
     "https://www.googleapis.com/auth/gmail.send",
 ]
 
-REDIRECT_URI = "http://localhost:9876/callback"
+REDIRECT_URI = "http://127.0.0.1:9876/callback"
 
 
 def gmail_oauth_flow(client_id: str, client_secret: str) -> dict:

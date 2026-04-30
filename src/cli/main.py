@@ -91,12 +91,22 @@ def add_gmail(ctx, client_id: str, client_secret: str, set_default: bool):
         console.print(f"[red]OAuth failed: {e}[/red]")
         return
 
-    # Get email address from tokens
-    # We'll get it from the first API call
+    # Get email address from Gmail API
     console.print("[green]✓ Authorization successful![/green]")
 
-    # Prompt for email (or could extract from token)
-    email_addr = click.prompt("Email address")
+    try:
+        import httpx
+        resp = httpx.get(
+            "https://gmail.googleapis.com/gmail/v1/users/me/profile",
+            headers={"Authorization": f"Bearer {tokens['access_token']}"},
+            timeout=10,
+        )
+        email_addr = resp.json().get("emailAddress", "")
+    except Exception:
+        email_addr = ""
+
+    if not email_addr:
+        email_addr = click.prompt("Email address")
 
     # Save account
     account = MailAccount(

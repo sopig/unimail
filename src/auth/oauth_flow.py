@@ -66,7 +66,7 @@ def run_local_oauth(auth_url: str, port: int = 9876, timeout: int = 300) -> str:
     OAuthCallbackHandler.code = None
     OAuthCallbackHandler.error = None
 
-    server = HTTPServer(("localhost", port), OAuthCallbackHandler)
+    server = HTTPServer(("127.0.0.1", port), OAuthCallbackHandler)
     server.timeout = timeout
 
     # Open browser
