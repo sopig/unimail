@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Optional
 
 import httpx
-from msal import ConfidentialClientApplication
+from msal import ConfidentialClientApplication, PublicClientApplication
 
 from .base import MailConnector
 from ..models import (
@@ -30,14 +30,14 @@ class OutlookConnector(MailConnector):
     Supports OAuth 2.0, delta sync, and full Graph search.
     """
 
-    def __init__(self, account: MailAccount, tokens: dict):
+    def __init__(self, account: MailAccount, tokens: dict, token_store=None):
         """
         tokens: {
             "access_token": "...",
             "refresh_token": "...",
         }
         """
-        super().__init__(account)
+        super().__init__(account, token_store=token_store)
         self.config: OutlookConfig = account.config  # type: ignore
         self._tokens = tokens
         self._client: Optional[httpx.AsyncClient] = None
@@ -45,11 +45,20 @@ class OutlookConnector(MailConnector):
 
     async def connect(self) -> None:
         """Initialize MSAL and HTTP client."""
-        self._msal_app = ConfidentialClientApplication(
-            client_id=self.config.client_id,
-            client_credential=self.config.client_secret,
-            authority=f"https://login.microsoftonline.com/{self.config.tenant_id}",
-        )
+        # Use consumers authority for personal accounts when no client_secret
+        if self.config.client_secret:
+            authority = f"https://login.microsoftonline.com/{self.config.tenant_id}"
+            self._msal_app = ConfidentialClientApplication(
+                client_id=self.config.client_id,
+                client_credential=self.config.client_secret,
+                authority=authority,
+            )
+        else:
+            authority = "https://login.microsoftonline.com/consumers"
+            self._msal_app = PublicClientApplication(
+                client_id=self.config.client_id,
+                authority=authority,
+            )
 
         # Try to get token silently using refresh token
         access_token = await self._get_access_token()
@@ -79,6 +88,7 @@ class OutlookConnector(MailConnector):
             self._tokens["access_token"] = result["access_token"]
             if "refresh_token" in result:
                 self._tokens["refresh_token"] = result["refresh_token"]
+            self._persist_tokens()
             return result["access_token"]
 
         # Fallback to existing token

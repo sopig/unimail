@@ -61,12 +61,12 @@ class MailEngine:
         tokens = self.token_store.get(account.id) or {}
 
         if account.provider == Provider.GMAIL:
-            connector = GmailConnector(account, tokens)
+            connector = GmailConnector(account, tokens, token_store=self.token_store)
         elif account.provider == Provider.OUTLOOK:
-            connector = OutlookConnector(account, tokens)
+            connector = OutlookConnector(account, tokens, token_store=self.token_store)
         elif account.provider == Provider.IMAP:
             password = tokens.get("password", "")
-            connector = ImapSmtpConnector(account, password)
+            connector = ImapSmtpConnector(account, password, token_store=self.token_store)
         else:
             raise ValueError(f"Unknown provider: {account.provider}")
 
@@ -345,6 +345,64 @@ class MailEngine:
         connector = self._get_connector(msg.account_id)
         await connector.mark_read(msg.external_id)
         self.db.mark_read(message_id)
+
+    async def mark_unread(self, message_id: str) -> None:
+        msg = await self.get_message(message_id)
+        connector = self._get_connector(msg.account_id)
+        await connector.mark_unread(msg.external_id)
+
+    async def star_message(self, message_id: str) -> None:
+        msg = await self.get_message(message_id)
+        connector = self._get_connector(msg.account_id)
+        if hasattr(connector, 'star'):
+            await connector.star(msg.external_id)
+
+    async def unstar_message(self, message_id: str) -> None:
+        msg = await self.get_message(message_id)
+        connector = self._get_connector(msg.account_id)
+        if hasattr(connector, 'unstar'):
+            await connector.unstar(msg.external_id)
+
+    async def forward_message(
+        self, message_id: str, to: list[str], comment: str = ""
+    ) -> dict:
+        """Forward a message to other recipients."""
+        msg = await self.get_message(message_id)
+        account = self.db.get_account(msg.account_id)
+        if not account:
+            raise ValueError(f"Account not found for message: {message_id}")
+
+        connector = self._get_connector(account.id)
+
+        # Check rate limit
+        is_allowed, current_count, limit = self.check_rate_limit(account.id)
+        if not is_allowed:
+            raise ValueError(
+                f"Daily send limit reached ({current_count}/{limit}) for {account.email}"
+            )
+
+        # Build forwarded message body
+        fwd_header = f"\n\n---------- 转发的邮件 ----------\nFrom: {msg.from_contact.name or ''} <{msg.from_contact.email}>\nDate: {msg.received_at.strftime('%Y-%m-%d %H:%M:%S')}\nSubject: {msg.subject}\n"
+        body_text = (comment + fwd_header + (msg.body_text or "(no text content)")) if comment else (fwd_header + (msg.body_text or "(no text content)"))
+        body_html = markdown.markdown(body_text, extensions=["tables", "fenced_code"])
+
+        subject = f"Fwd: {msg.subject}" if not msg.subject.startswith("Fwd:") else msg.subject
+
+        logger.info(
+            f"Forwarding message {message_id}: to={to}",
+            extra={"account_id": account.id, "action": "forward"},
+        )
+
+        result_id = await connector.send_message(
+            to=to,
+            subject=subject,
+            body_text=body_text,
+            body_html=body_html,
+        )
+
+        self.record_send(account.id, to, subject)
+
+        return {"message_id": result_id, "from": account.email, "to": to}
 
     async def archive_messages(self, message_ids: list[str]) -> None:
         for mid in message_ids:

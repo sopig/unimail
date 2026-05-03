@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import email
+import email.header
 import email.utils
 import email.policy
+import re
 import time
 from datetime import datetime
 from email.mime.multipart import MIMEMultipart
@@ -42,8 +44,8 @@ class ImapSmtpConnector(MailConnector):
     Supports connection pooling with keep-alive and automatic reconnection.
     """
 
-    def __init__(self, account: MailAccount, password: str):
-        super().__init__(account)
+    def __init__(self, account: MailAccount, password: str, token_store=None):
+        super().__init__(account, token_store=token_store)
         self.config: ImapConfig = account.config  # type: ignore
         self.password = password
         self._connection: Optional[aioimaplib.IMAP4_SSL] = None
@@ -139,7 +141,7 @@ class ImapSmtpConnector(MailConnector):
         unread_only: bool = False,
         since: Optional[str] = None,
     ) -> list[UnifiedMessage]:
-        """List messages via IMAP SEARCH + FETCH."""
+        """List messages via IMAP SEARCH + FETCH (ENVELOPE FLAGS only — fast)."""
         await self._ensure_connected()
         assert self._connection is not None
 
@@ -168,14 +170,32 @@ class ImapSmtpConnector(MailConnector):
         if not seq_nums:
             return []
 
-        # Fetch each message by RFC822 and parse with email module
+        # Fetch ENVELOPE + FLAGS for all messages at once
+        seq_set = ",".join(
+            seq.decode() if isinstance(seq, bytes) else seq for seq in seq_nums
+        )
+        status, data = await self._connection.fetch(seq_set, "(ENVELOPE FLAGS)")
+        if status != "OK" or not data:
+            return []
+
+        # Parse each FETCH response line
         messages = []
-        for seq in seq_nums:
-            seq_str = seq.decode() if isinstance(seq, bytes) else seq
+        for item in data:
+            if isinstance(item, bytes):
+                line = item.decode("utf-8", errors="replace")
+            elif isinstance(item, str):
+                line = item
+            else:
+                continue
+
+            if "FETCH" not in line:
+                continue
+
             try:
-                msg = await self.get_message(seq_str)
+                msg = self._parse_envelope(line)
                 messages.append(msg)
             except Exception:
+                logger.debug("Failed to parse ENVELOPE response", exc_info=True)
                 continue
 
         self._last_activity = time.time()
@@ -190,22 +210,26 @@ class ImapSmtpConnector(MailConnector):
         if status != "OK" or not data:
             raise ValueError(f"Message {external_id} not found")
 
-        # Parse raw email — aioimaplib returns:
-        # [0] response line (bytes), [1] RFC822 body (bytearray), [2] ")" , [3] completion msg
+        # Parse FLAGS from response line
+        is_read = True  # default to read; \Seen presence confirms it
         raw_email = None
         for item in data:
-            if isinstance(item, (bytes, bytearray)) and not isinstance(item, bytearray) == False:
-                # Skip small non-body items (response lines, closing parens)
-                if isinstance(item, bytearray) or (isinstance(item, bytes) and b"FETCH" not in item and len(item) > 100):
-                    raw_email = bytes(item) if isinstance(item, bytearray) else item
-                    break
+            if isinstance(item, bytes):
+                line = item.decode("utf-8", errors="replace")
+                if "FETCH" in line:
+                    # Parse FLAGS (...) from response line like: "1 FETCH (FLAGS (\Seen) RFC822 {...}"
+                    if r"\Seen" not in line:
+                        is_read = False
+            elif isinstance(item, bytearray):
+                raw_email = bytes(item)
+
         if raw_email is None:
             raise ValueError(f"Message {external_id} not found: no RFC822 data")
 
         msg = email.message_from_bytes(raw_email, policy=email.policy.default)
 
         self._last_activity = time.time()
-        return self._parse_full_email(msg, external_id)
+        return self._parse_full_email(msg, external_id, is_read=is_read)
 
     async def send_message(
         self,
@@ -436,8 +460,239 @@ class ImapSmtpConnector(MailConnector):
         }
         return mapping.get(folder, folder)
 
+    def _parse_envelope(self, fetch_line: str) -> UnifiedMessage:
+        """Parse a FETCH (ENVELOPE FLAGS) response line into a UnifiedMessage.
+
+        Example input:
+            * 1 FETCH (ENVELOPE ("date" "subject" (...) (...) (...) (...) ...) FLAGS (\\Seen))
+        """
+        # Extract sequence number — format: "123 FETCH (...)" or "* 123 FETCH (...)"
+        seq_match = re.match(r"(?:\*\s+)?(\d+)\s+FETCH\s*\(", fetch_line)
+        if not seq_match:
+            raise ValueError("No sequence number in FETCH response")
+        seq_num = seq_match.group(1)
+
+        # Extract FLAGS
+        flags_match = re.search(r"FLAGS\s*\(([^)]*)\)", fetch_line)
+        flags_str = flags_match.group(1) if flags_match else ""
+        is_read = r"\Seen" in flags_str
+
+        # Extract ENVELOPE content — everything between ENVELOPE ( and the closing )
+        # that matches back to the start of FLAGS or end of line
+        env_match = re.search(r"ENVELOPE\s*\(", fetch_line)
+        if not env_match:
+            raise ValueError("No ENVELOPE in FETCH response")
+
+        # Find the matching closing paren for ENVELOPE
+        start = env_match.end()  # position right after "ENVELOPE ("
+        depth = 1
+        pos = start
+        while pos < len(fetch_line) and depth > 0:
+            if fetch_line[pos] == "(":
+                depth += 1
+            elif fetch_line[pos] == ")":
+                depth -= 1
+            pos += 1
+        env_body = fetch_line[start : pos - 1]  # exclude the final closing paren
+
+        # Parse the top-level fields of the ENVELOPE.
+        # We split by respecting quoted strings and parenthesized groups.
+        fields = self._split_envelope_fields(env_body)
+
+        # ENVELOPE field indices:
+        # 0: date, 1: subject, 2: from, 3: sender, 4: reply-to,
+        # 5: to, 6: cc, 7: bcc, 8: in-reply-to, 9: message-id
+        date_str = self._unquote(fields[0]) if len(fields) > 0 else ""
+        subject = self._unquote(fields[1]) if len(fields) > 1 else ""
+        from_raw = fields[2] if len(fields) > 2 else ""
+        to_raw = fields[5] if len(fields) > 5 else ""
+        cc_raw = fields[6] if len(fields) > 6 else ""
+        in_reply_to = self._unquote(fields[8]) if len(fields) > 8 else None
+        message_id = self._unquote(fields[9]) if len(fields) > 9 else None
+
+        # Parse date
+        try:
+            received_at = email.utils.parsedate_to_datetime(date_str)
+        except Exception:
+            received_at = datetime.now()
+
+        # Parse addresses
+        from_contact = self._parse_address_struct(from_raw)
+        to_contacts = self._parse_address_list(to_raw)
+        cc_contacts = self._parse_address_list(cc_raw)
+
+        return UnifiedMessage(
+            id=f"imap_{self.account.id}_{seq_num}",
+            account_id=self.account.id,
+            external_id=seq_num,
+            thread_id=in_reply_to,
+            folder="inbox",
+            from_=from_contact,
+            to=to_contacts,
+            cc=cc_contacts,
+            subject=subject,
+            snippet="",
+            body_text="",
+            body_html=None,
+            attachments=[],
+            received_at=received_at,
+            is_read=is_read,
+            is_starred=False,
+            labels=[],
+        )
+
+    @staticmethod
+    def _split_envelope_fields(text: str) -> list[str]:
+        """Split ENVELOPE body into top-level fields, respecting quotes and parens."""
+        fields = []
+        i = 0
+        n = len(text)
+        while i < n:
+            # Skip whitespace and commas
+            while i < n and text[i] in " \t,":
+                i += 1
+            if i >= n:
+                break
+
+            if text[i] == '"':
+                # Quoted string — find closing quote, respecting escapes
+                j = i + 1
+                while j < n:
+                    if text[j] == "\\" and j + 1 < n:
+                        j += 2
+                    elif text[j] == '"':
+                        j += 1
+                        break
+                    else:
+                        j += 1
+                fields.append(text[i:j])
+                i = j
+            elif text[i] == "(":
+                # Parenthesized group — find matching close
+                depth = 1
+                j = i + 1
+                while j < n and depth > 0:
+                    if text[j] == "(":
+                        depth += 1
+                    elif text[j] == ")":
+                        depth -= 1
+                    elif text[j] == "\\" and j + 1 < n:
+                        j += 1  # skip escaped char
+                    j += 1
+                fields.append(text[i + 1 : j - 1])  # strip outer parens
+                i = j
+            elif text[i] == "N" and text[i : i + 3] == "NIL":
+                fields.append("NIL")
+                i += 3
+            else:
+                # Atom
+                j = i
+                while j < n and text[j] not in ' \t,()"':
+                    j += 1
+                fields.append(text[i:j])
+                i = j
+        return fields
+
+    @staticmethod
+    def _unquote(s: str) -> str:
+        """Remove surrounding quotes, unescape, and decode MIME encoded-words."""
+        if not s or s == "NIL":
+            return ""
+        if len(s) >= 2 and s[0] == '"' and s[-1] == '"':
+            s = s[1:-1].replace('\\"', '"').replace("\\\\", "\\")
+        # Decode MIME encoded-words like =?UTF-8?B?...?= or =?UTF-8?Q?...?=
+        if "=?" in s:
+            decoded_parts = email.header.decode_header(s)
+            result = []
+            for part, charset in decoded_parts:
+                if isinstance(part, bytes):
+                    result.append(part.decode(charset or "utf-8", errors="replace"))
+                else:
+                    result.append(part)
+            s = "".join(result)
+        return s
+
+    @staticmethod
+    def _parse_address_struct(raw: str) -> Contact:
+        """Parse a single IMAP address struct: (personal NIL mailbox host) or NIL.
+
+        Input may have outer parens still present, e.g.:
+        ("name" NIL "mailbox" "host")
+        or without parens:
+        "name" NIL "mailbox" "host"
+        """
+        if not raw or raw == "NIL":
+            return Contact(name=None, email="")
+        text = raw.strip()
+        # Strip outer parens if present
+        if text.startswith("(") and text.endswith(")"):
+            text = text[1:-1].strip()
+        parts = ImapSmtpConnector._split_envelope_fields(text)
+        personal = ImapSmtpConnector._unquote(parts[0]) if len(parts) > 0 else ""
+        mailbox = ImapSmtpConnector._unquote(parts[2]) if len(parts) > 2 else ""
+        host = ImapSmtpConnector._unquote(parts[3]) if len(parts) > 3 else ""
+        addr = f"{mailbox}@{host}" if mailbox and host else mailbox
+        return Contact(name=personal or None, email=addr)
+
+    @staticmethod
+    def _parse_address_list(raw: str) -> list[Contact]:
+        """Parse a list of IMAP address structs from ENVELOPE field.
+
+        Input is the content inside the outer parens of the to/cc field,
+        which may contain multiple address structs like:
+            ("John" NIL john example.com)("Jane" NIL jane example.com)
+        or with an extra wrapping layer:
+            (("John" NIL john example.com))
+        or NIL for empty.
+        """
+        if not raw or raw == "NIL":
+            return []
+        # If the content starts with '(' and all content is inside one
+        # group, strip the outer layer (IMAP wraps address lists in parens)
+        text = raw.strip()
+        if text.startswith("(") and text.endswith(")"):
+            # Check if it's a single group (no sibling groups at the same level)
+            depth = 0
+            has_sibling = False
+            for idx, ch in enumerate(text):
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth == 0 and idx < len(text) - 1:
+                        has_sibling = True
+                        break
+            if not has_sibling:
+                text = text[1:-1].strip()
+
+        contacts = []
+        i = 0
+        n = len(text)
+        while i < n:
+            while i < n and text[i] in " \t":
+                i += 1
+            if i >= n:
+                break
+            if text[i] == "(":
+                depth = 1
+                j = i + 1
+                while j < n and depth > 0:
+                    if text[j] == "(":
+                        depth += 1
+                    elif text[j] == ")":
+                        depth -= 1
+                    elif text[j] == "\\" and j + 1 < n:
+                        j += 1
+                    j += 1
+                inner = text[i + 1 : j - 1]
+                contacts.append(ImapSmtpConnector._parse_address_struct(inner))
+                i = j
+            else:
+                i += 1
+        return contacts
+
     def _parse_full_email(
-        self, msg: email.message.Message, uid: str
+        self, msg: email.message.Message, uid: str, *, is_read: bool = True
     ) -> UnifiedMessage:
         """Parse a full email.message.Message into UnifiedMessage."""
         # From
@@ -510,7 +765,7 @@ class ImapSmtpConnector(MailConnector):
             body_html=body_html,
             attachments=attachments,
             received_at=received_at,
-            is_read=False,  # Would check \Seen flag
+            is_read=is_read,
             is_starred=False,
             labels=[],
         )

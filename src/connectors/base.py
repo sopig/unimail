@@ -11,8 +11,14 @@ from ..models import Attachment, MailAccount, UnifiedMessage
 class MailConnector(ABC):
     """Abstract interface that all mail connectors must implement."""
 
-    def __init__(self, account: MailAccount):
+    def __init__(self, account: MailAccount, token_store=None):
         self.account = account
+        self._token_store = token_store
+
+    def _persist_tokens(self) -> None:
+        """Persist current tokens to TokenStore if available."""
+        if self._token_store and hasattr(self, '_tokens') and self._tokens:
+            self._token_store.save(self.account.id, self._tokens)
 
     @abstractmethod
     async def connect(self) -> None:

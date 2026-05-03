@@ -243,6 +243,49 @@ class UniMailServer:
                         "required": ["message_id", "attachment_id"],
                     },
                 ),
+                Tool(
+                    name="mail_mark",
+                    description="标记邮件状态：已读、未读、星标、取消星标。",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "message_ids": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "邮件ID列表",
+                            },
+                            "action": {
+                                "type": "string",
+                                "enum": ["read", "unread", "star", "unstar"],
+                                "description": "标记操作",
+                            },
+                        },
+                        "required": ["message_ids", "action"],
+                    },
+                ),
+                Tool(
+                    name="mail_forward",
+                    description="转发邮件给其他人。可添加附言。",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "message_id": {
+                                "type": "string",
+                                "description": "要转发的邮件ID",
+                            },
+                            "to": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "收件人邮箱列表",
+                            },
+                            "comment": {
+                                "type": "string",
+                                "description": "转发附言",
+                            },
+                        },
+                        "required": ["message_id", "to"],
+                    },
+                ),
             ]
 
         @self.server.call_tool()
@@ -309,8 +352,9 @@ class UniMailServer:
             accounts = self.db.get_accounts()
             lines = ["📬 已连接的邮箱账户:\n"]
             for a in accounts:
-                default = " ★" if a.is_default else ""
+                default = " ★默认" if a.is_default else ""
                 lines.append(f"  • {a.email} ({a.provider.value}){default}")
+                lines.append(f"    ID: {a.id}")
             if not accounts:
                 lines.append("  (无账户，请用 `unimail add` 命令添加)")
             return "\n".join(lines)
@@ -333,6 +377,34 @@ class UniMailServer:
             )
             return f"✅ 附件已保存: {path}"
 
+        elif tool_name == "mail_mark":
+            ids = args["message_ids"]
+            action = args["action"]
+            if action == "read":
+                for mid in ids:
+                    await self.engine.mark_read(mid)
+                return f"✅ {len(ids)} 封邮件已标记为已读"
+            elif action == "unread":
+                for mid in ids:
+                    await self.engine.mark_unread(mid)
+                return f"✅ {len(ids)} 封邮件已标记为未读"
+            elif action == "star":
+                for mid in ids:
+                    await self.engine.star_message(mid)
+                return f"✅ {len(ids)} 封邮件已加星标"
+            elif action == "unstar":
+                for mid in ids:
+                    await self.engine.unstar_message(mid)
+                return f"✅ {len(ids)} 封邮件已取消星标"
+
+        elif tool_name == "mail_forward":
+            result = await self.engine.forward_message(
+                message_id=args["message_id"],
+                to=args["to"],
+                comment=args.get("comment", ""),
+            )
+            return f"✅ 邮件已转发\nFrom: {result['from']}\nTo: {', '.join(result['to'])}"
+
         else:
             raise ValueError(f"Unknown tool: {tool_name}")
 
@@ -348,10 +420,12 @@ class UniMailServer:
             att_icon = " 📎" if msg.attachments else ""
             time_str = msg.received_at.strftime("%m-%d %H:%M")
             from_str = msg.from_contact.name or msg.from_contact.email
+            # Use short ID for Agent token efficiency
+            short_id = msg.external_id
             lines.append(
                 f"{read_icon} {i}. [{time_str}] {from_str}{att_icon}\n"
                 f"      {msg.subject}\n"
-                f"      ID: {msg.id}"
+                f"      ID: {short_id}"
             )
         return "\n".join(lines)
 
@@ -366,17 +440,39 @@ class UniMailServer:
         lines.extend([
             f"Subject: {msg.subject}",
             f"Date: {msg.received_at.strftime('%Y-%m-%d %H:%M:%S')}",
-            f"ID: {msg.id}",
+            f"ID: {msg.external_id}",
             f"━━━━━━━━━━━━━━━",
             "",
-            msg.body_text or "(HTML only - no text content)",
         ])
+
+        # Body: prefer plain text, fallback to HTML→text conversion
+        body = msg.body_text
+        if not body and msg.body_html:
+            body = self._html_to_text(msg.body_html)
+        lines.append(body or "(no content)")
+
         if msg.attachments:
             lines.append("\n📎 附件:")
             for att in msg.attachments:
                 size_kb = att.size / 1024
                 lines.append(f"  • {att.filename} ({size_kb:.1f}KB) [ID: {att.id}]")
         return "\n".join(lines)
+
+    @staticmethod
+    def _html_to_text(html: str) -> str:
+        """Convert HTML to plain text for Agent readability."""
+        try:
+            import html2text
+            h = html2text.HTML2Text()
+            h.ignore_links = False
+            h.ignore_images = True
+            h.body_width = 0  # no line wrapping
+            return h.handle(html).strip()
+        except Exception:
+            # Fallback: strip tags
+            import re
+            text = re.sub(r"<[^>]+>", "", html)
+            return text.strip()
 
 
 async def run_server(passphrase: str = "unimail-default"):

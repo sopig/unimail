@@ -21,6 +21,7 @@ dependencies = [
     "uvicorn[standard]>=0.30.0",
     # Utilities
     "markdown>=3.5",
+    "html2text>=2024.2",
     "cryptography>=42.0.0",
     "click>=8.1.0",
     "rich>=13.0.0",

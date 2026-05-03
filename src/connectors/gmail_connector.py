@@ -31,7 +31,7 @@ class GmailConnector(MailConnector):
     Supports OAuth 2.0, incremental sync via historyId, and full Gmail search.
     """
 
-    def __init__(self, account: MailAccount, tokens: dict):
+    def __init__(self, account: MailAccount, tokens: dict, token_store=None):
         """
         tokens: {
             "access_token": "...",
@@ -42,7 +42,7 @@ class GmailConnector(MailConnector):
             "expiry": "..."
         }
         """
-        super().__init__(account)
+        super().__init__(account, token_store=token_store)
         self.config: GmailConfig = account.config  # type: ignore
         self._tokens = tokens
         self._service = None
@@ -63,6 +63,7 @@ class GmailConnector(MailConnector):
             self._tokens["access_token"] = creds.token
             if creds.expiry:
                 self._tokens["expiry"] = creds.expiry.isoformat()
+            self._persist_tokens()
 
         self._service = build("gmail", "v1", credentials=creds)
 
@@ -230,6 +231,18 @@ class GmailConnector(MailConnector):
         assert self._service is not None
         self._service.users().messages().trash(userId="me", id=external_id).execute()
 
+    async def star(self, external_id: str) -> None:
+        assert self._service is not None
+        self._service.users().messages().modify(
+            userId="me", id=external_id, body={"addLabelIds": ["STARRED"]}
+        ).execute()
+
+    async def unstar(self, external_id: str) -> None:
+        assert self._service is not None
+        self._service.users().messages().modify(
+            userId="me", id=external_id, body={"removeLabelIds": ["STARRED"]}
+        ).execute()
+
     async def search(
         self,
         query: str,
@@ -239,6 +252,8 @@ class GmailConnector(MailConnector):
         limit: int = 10,
     ) -> list[UnifiedMessage]:
         """Gmail native search (very powerful)."""
+        assert self._service is not None
+
         parts = [query]
         if from_filter:
             parts.append(f"from:{from_filter}")
@@ -247,7 +262,28 @@ class GmailConnector(MailConnector):
         if date_to:
             parts.append(f"before:{date_to}")
 
-        return await self.list_messages(folder="all", limit=limit, since=None)
+        q = " ".join(parts)
+
+        result = (
+            self._service.users()
+            .messages()
+            .list(userId="me", q=q, maxResults=limit)
+            .execute()
+        )
+
+        message_ids = [m["id"] for m in result.get("messages", [])]
+        if not message_ids:
+            return []
+
+        messages = []
+        for msg_id in message_ids:
+            try:
+                msg = await self.get_message(msg_id)
+                messages.append(msg)
+            except Exception:
+                continue
+
+        return messages
 
     async def download_attachment(
         self, message_id: str, attachment_id: str
