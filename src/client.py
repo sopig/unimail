@@ -44,7 +44,7 @@ class UniMail:
         self._data_dir = Path(data_dir) if data_dir else DEFAULT_DATA_DIR
         self._data_dir.mkdir(parents=True, exist_ok=True)
 
-        passphrase = passphrase or os.environ.get("UNIMAIL_PASSPHRASE", "unimail-default")
+        passphrase = passphrase or os.environ.get("UNIMAIL_PASSPHRASE")
 
         self._db = Database(self._data_dir / "unimail.db")
         self._ts = TokenStore(self._data_dir / "tokens.enc", passphrase)

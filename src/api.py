@@ -170,7 +170,7 @@ class WebhookResponse(BaseModel):
 
 
 def create_app(
-    passphrase: str = "unimail-default",
+    passphrase: str | None = None,
     engine: Optional[MailEngine] = None,
 ) -> FastAPI:
     """
@@ -220,11 +220,12 @@ def create_app(
         lifespan=lifespan,
     )
 
-    # CORS 中间件
+    # CORS middleware — restrict to localhost by default
+    cors_origins = config.security.cors_origins or ["http://localhost:*", "http://127.0.0.1:*"]
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=True,
+        allow_origins=cors_origins,
+        allow_credentials=False,
         allow_methods=["*"],
         allow_headers=["*"],
     )

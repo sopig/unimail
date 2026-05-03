@@ -58,12 +58,18 @@ class GmailConnector(MailConnector):
         )
         # Refresh if expired
         if creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-            # Update stored tokens
-            self._tokens["access_token"] = creds.token
-            if creds.expiry:
-                self._tokens["expiry"] = creds.expiry.isoformat()
-            self._persist_tokens()
+            try:
+                creds.refresh(Request())
+                # Update stored tokens
+                self._tokens["access_token"] = creds.token
+                if creds.expiry:
+                    self._tokens["expiry"] = creds.expiry.isoformat()
+                self._persist_tokens()
+            except Exception as e:
+                raise ConnectionError(
+                    f"Gmail OAuth token refresh failed. Please re-authorize: "
+                    f"run `unimail add gmail` again. Error: {e}"
+                ) from e
 
         self._service = build("gmail", "v1", credentials=creds)
 

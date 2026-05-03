@@ -9,7 +9,7 @@ from typing import Any
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
-from mcp.types import TextContent, Tool
+from mcp.types import TextContent, Tool, Resource, LoggingLevel
 
 from .engine.mail_engine import MailEngine
 from .storage.database import Database
@@ -30,12 +30,13 @@ def get_data_dir() -> Path:
 class UniMailServer:
     """MCP Server that wraps MailEngine and exposes tools."""
 
-    def __init__(self, passphrase: str = "unimail-default"):
+    def __init__(self, passphrase: str | None = None):
         self.data_dir = get_data_dir()
         self.db = Database(self.data_dir / "unimail.db")
         self.token_store = TokenStore(self.data_dir / "tokens.enc", passphrase)
         self.engine = MailEngine(self.db, self.token_store)
         self.server = Server("unimail")
+        self._request_context = None  # for sending notifications
         self._register_tools()
 
     def _register_tools(self):
@@ -286,6 +287,11 @@ class UniMailServer:
                         "required": ["message_id", "to"],
                     },
                 ),
+                Tool(
+                    name="mail_check_new",
+                    description="检查是否有新邮件到达（后台自动同步）。返回上次检查以来的新邮件数量和摘要，并重置计数器。",
+                    inputSchema={"type": "object", "properties": {}},
+                ),
             ]
 
         @self.server.call_tool()
@@ -295,6 +301,39 @@ class UniMailServer:
                 return [TextContent(type="text", text=result)]
             except Exception as e:
                 return [TextContent(type="text", text=f"❌ Error: {str(e)}")]
+
+        @self.server.list_resources()
+        async def list_resources() -> list[Resource]:
+            return [
+                Resource(
+                    uri="unimail://new-messages",
+                    name="New Messages",
+                    description="New messages since last check (updated by background sync)",
+                    mimeType="application/json",
+                ),
+            ]
+
+        @self.server.read_resource()
+        async def read_resource(uri) -> str:
+            if str(uri) == "unimail://new-messages":
+                result = await self.engine.check_new_messages()
+                return json.dumps(result, default=str, ensure_ascii=False)
+            raise ValueError(f"Unknown resource: {uri}")
+
+        # Register notification callback for new messages from background sync
+        async def _on_new_mail(count: int) -> None:
+            """Send MCP log notification when background sync finds new messages."""
+            try:
+                ctx = self.server.request_context
+                if ctx and hasattr(ctx, 'session'):
+                    await ctx.session.send_log_message(
+                        level="info",
+                        data=f"UniMail: {count} new email(s) received. Use mail_check_new to see details.",
+                    )
+            except Exception:
+                pass  # Notification is best-effort
+
+        self.engine._on_new_messages = _on_new_mail
 
     async def _dispatch(self, tool_name: str, args: dict) -> str:
         """Route tool calls to engine methods."""
@@ -405,6 +444,23 @@ class UniMailServer:
             )
             return f"✅ 邮件已转发\nFrom: {result['from']}\nTo: {', '.join(result['to'])}"
 
+        elif tool_name == "mail_check_new":
+            result = await self.engine.check_new_messages()
+            if result["new_count"] == 0:
+                sync_info = f" (上次同步: {result['last_sync_at']})" if result.get("last_sync_at") else ""
+                return f"📭 没有新邮件{sync_info}"
+            messages = result["messages"]
+            lines = [f"📬 {result['new_count']} 封新邮件:\n"]
+            for i, msg in enumerate(messages, 1):
+                from_str = msg.from_contact.name or msg.from_contact.email
+                time_str = msg.received_at.strftime("%m-%d %H:%M")
+                lines.append(
+                    f"  {i}. [{time_str}] {from_str}\n"
+                    f"     {msg.subject}\n"
+                    f"     ID: {msg.external_id}"
+                )
+            return "\n".join(lines)
+
         else:
             raise ValueError(f"Unknown tool: {tool_name}")
 
@@ -475,10 +531,21 @@ class UniMailServer:
             return text.strip()
 
 
-async def run_server(passphrase: str = "unimail-default"):
+async def run_server(passphrase: str | None = None):
     """Run the MCP server over stdio."""
     mail_server = UniMailServer(passphrase)
     await mail_server.engine.initialize()
+
+    # Do initial sync in background (don't block server startup)
+    async def _initial_sync():
+        try:
+            count = await mail_server.engine.sync_all()
+            if count > 0:
+                mail_server.engine._new_since_last_check += count
+        except Exception:
+            pass
+
+    asyncio.create_task(_initial_sync())
 
     async with stdio_server() as (read_stream, write_stream):
         await mail_server.server.run(read_stream, write_stream)
@@ -487,7 +554,7 @@ async def run_server(passphrase: str = "unimail-default"):
 def main():
     """Entry point for MCP server."""
     import sys
-    passphrase = sys.argv[1] if len(sys.argv) > 1 else "unimail-default"
+    passphrase = sys.argv[1] if len(sys.argv) > 1 else None
     asyncio.run(run_server(passphrase))
 
 

@@ -35,6 +35,7 @@ class SecurityConfig:
     api_token: str = ""
     jwt_secret: str = ""
     jwt_expire_hours: int = 24
+    cors_origins: list[str] = field(default_factory=lambda: ["http://localhost:*", "http://127.0.0.1:*"])
 
 
 @dataclass
@@ -53,6 +54,12 @@ class CacheConfig:
 class ImapPoolConfig:
     connection_timeout: int = 30  # seconds
     keepalive: bool = True
+
+
+@dataclass
+class SyncConfig:
+    enabled: bool = True
+    interval: int = 300  # seconds between periodic syncs (default 5 min)
 
 
 @dataclass
@@ -75,6 +82,7 @@ class UniMailConfig:
     rate_limit: RateLimitConfig = field(default_factory=RateLimitConfig)
     cache: CacheConfig = field(default_factory=CacheConfig)
     imap: ImapPoolConfig = field(default_factory=ImapPoolConfig)
+    sync: SyncConfig = field(default_factory=SyncConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     webhooks: list[WebhookEntry] = field(default_factory=list)
 
@@ -106,6 +114,8 @@ def _env_override(config: UniMailConfig) -> None:
         config.security.jwt_secret = v
     if v := os.environ.get("UNIMAIL_JWT_EXPIRE_HOURS"):
         config.security.jwt_expire_hours = int(v)
+    if v := os.environ.get("UNIMAIL_CORS_ORIGINS"):
+        config.security.cors_origins = [o.strip() for o in v.split(",")]
 
     # Rate limit
     if v := os.environ.get("UNIMAIL_RATE_LIMIT_DAILY"):
@@ -124,6 +134,12 @@ def _env_override(config: UniMailConfig) -> None:
         config.imap.connection_timeout = int(v)
     if v := os.environ.get("UNIMAIL_IMAP_KEEPALIVE"):
         config.imap.keepalive = v.lower() in ("true", "1", "yes")
+
+    # Sync
+    if v := os.environ.get("UNIMAIL_SYNC_ENABLED"):
+        config.sync.enabled = v.lower() in ("true", "1", "yes")
+    if v := os.environ.get("UNIMAIL_SYNC_INTERVAL"):
+        config.sync.interval = int(v)
 
     # Logging
     if v := os.environ.get("UNIMAIL_LOG_LEVEL"):
@@ -160,6 +176,8 @@ def get_config(reload: bool = False) -> UniMailConfig:
             config.security.jwt_secret = s["jwt_secret"]
         if "jwt_expire_hours" in s:
             config.security.jwt_expire_hours = s["jwt_expire_hours"]
+        if "cors_origins" in s:
+            config.security.cors_origins = s["cors_origins"]
 
     if "rate_limit" in data:
         s = data["rate_limit"]
@@ -181,6 +199,13 @@ def get_config(reload: bool = False) -> UniMailConfig:
             config.imap.connection_timeout = s["connection_timeout"]
         if "keepalive" in s:
             config.imap.keepalive = s["keepalive"]
+
+    if "sync" in data:
+        s = data["sync"]
+        if "enabled" in s:
+            config.sync.enabled = s["enabled"]
+        if "interval" in s:
+            config.sync.interval = s["interval"]
 
     if "logging" in data:
         s = data["logging"]

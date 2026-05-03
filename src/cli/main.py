@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import uuid
 from pathlib import Path
 from typing import Optional
@@ -29,6 +30,7 @@ from ..storage.token_store import TokenStore
 
 console = Console()
 DATA_DIR = Path.home() / ".unimail" / "data"
+_INBOX_INDEX = DATA_DIR / ".last_inbox.json"
 
 
 def get_db() -> Database:
@@ -36,7 +38,7 @@ def get_db() -> Database:
     return Database(DATA_DIR / "unimail.db")
 
 
-def get_token_store(passphrase: str = "unimail-default") -> TokenStore:
+def get_token_store(passphrase: str | None = None) -> TokenStore:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     return TokenStore(DATA_DIR / "tokens.enc", passphrase)
 
@@ -44,6 +46,37 @@ def get_token_store(passphrase: str = "unimail-default") -> TokenStore:
 def _run_async(coro):
     """包装异步协程为同步调用。"""
     return asyncio.run(coro)
+
+
+def _save_inbox_index(messages: list) -> None:
+    """Save message ID index for read-by-number support."""
+    index = {str(i): msg.id for i, msg in enumerate(messages, 1)}
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    _INBOX_INDEX.write_text(json.dumps(index))
+
+
+def _resolve_message_id(message_id: str) -> str:
+    """Resolve a message_id that might be an inbox sequence number."""
+    if message_id.isdigit() and _INBOX_INDEX.exists():
+        index = json.loads(_INBOX_INDEX.read_text())
+        resolved = index.get(message_id)
+        if resolved:
+            return resolved
+    return message_id
+
+
+def _html_to_markdown(html: str) -> str:
+    """Convert HTML to Markdown for terminal display."""
+    try:
+        import html2text
+        h = html2text.HTML2Text()
+        h.ignore_links = False
+        h.ignore_images = True
+        h.body_width = 0
+        return h.handle(html).strip()
+    except Exception:
+        import re
+        return re.sub(r"<[^>]+>", "", html).strip()
 
 
 def _get_engine(passphrase: str):
@@ -55,11 +88,11 @@ def _get_engine(passphrase: str):
 
 
 @click.group()
-@click.option("--passphrase", default="unimail-default", envvar="UNIMAIL_PASSPHRASE",
-              help="Passphrase for token encryption")
+@click.option("--passphrase", default=None, envvar="UNIMAIL_PASSPHRASE",
+              help="Passphrase for token encryption (auto-generated if not set)")
 @click.pass_context
-def cli(ctx, passphrase: str):
-    """📮 UniMail - Unified email gateway for AI agents."""
+def cli(ctx, passphrase: str | None):
+    """UniMail - Unified email gateway for AI agents."""
     ctx.ensure_object(dict)
     ctx.obj["passphrase"] = passphrase
 
@@ -132,16 +165,23 @@ def add_gmail(ctx, client_id: str, client_secret: str, set_default: bool):
 
 
 @add.command("outlook")
-@click.option("--client-id", required=True, help="Azure AD App Client ID")
-@click.option("--client-secret", required=True, help="Azure AD App Client Secret")
-@click.option("--tenant-id", default="common", help="Tenant ID (default: common)")
+@click.option("--client-id", default=None, help="Azure AD App Client ID (required for personal accounts)")
+@click.option("--client-secret", default=None, help="Azure AD App Client Secret (required for personal accounts)")
+@click.option("--tenant-id", default="consumers", help="Tenant ID (default: consumers for personal accounts)")
 @click.option("--set-default", is_flag=True, help="Set as default account")
 @click.pass_context
 def add_outlook(ctx, client_id: str, client_secret: str, tenant_id: str, set_default: bool):
-    """Add an Outlook/Hotmail account via OAuth."""
-    from ..auth.outlook_auth import outlook_oauth_flow
+    """Add an Outlook/Hotmail account via OAuth.
+
+    Requires an Azure AD app registration. Run without options to see setup guide.
+    """
+    from ..auth.outlook_auth import outlook_oauth_flow, print_azure_setup_guide
 
     console.print("\n[bold blue]Adding Outlook/Hotmail account...[/bold blue]")
+
+    if not client_id or not client_secret:
+        print_azure_setup_guide()
+        return
 
     try:
         tokens = outlook_oauth_flow(client_id, client_secret, tenant_id)
@@ -149,8 +189,23 @@ def add_outlook(ctx, client_id: str, client_secret: str, tenant_id: str, set_def
         console.print(f"[red]OAuth failed: {e}[/red]")
         return
 
-    console.print("[green]✓ Authorization successful![/green]")
-    email_addr = click.prompt("Email address")
+    console.print("[green]Authorization successful![/green]")
+
+    # Auto-detect email from Graph API
+    email_addr = ""
+    try:
+        import httpx
+        resp = httpx.get(
+            "https://graph.microsoft.com/v1.0/me",
+            headers={"Authorization": f"Bearer {tokens['access_token']}"},
+            timeout=10,
+        )
+        email_addr = resp.json().get("mail") or resp.json().get("userPrincipalName", "")
+    except Exception:
+        pass
+
+    if not email_addr:
+        email_addr = click.prompt("Email address")
 
     account = MailAccount(
         id=str(uuid.uuid4()),
@@ -172,7 +227,7 @@ def add_outlook(ctx, client_id: str, client_secret: str, tenant_id: str, set_def
     db.save_account(account)
     token_store.save(account.id, tokens)
 
-    console.print(f"\n[bold green]✅ Outlook account added: {email_addr}[/bold green]")
+    console.print(f"\n[bold green]Outlook account added: {email_addr}[/bold green]")
 
 
 @add.command("imap")
@@ -355,6 +410,9 @@ def inbox(ctx, limit: int, unread: bool, account: Optional[str]):
         console.print("[dim]📭 收件箱为空[/dim]")
         return
 
+    # Save index for read-by-number
+    _save_inbox_index(messages)
+
     table = Table(title=f"📥 收件箱 ({len(messages)} 封)")
     table.add_column("", width=2)
     table.add_column("#", style="dim", width=3)
@@ -378,15 +436,16 @@ def inbox(ctx, limit: int, unread: bool, account: Optional[str]):
 @click.argument("message_id")
 @click.pass_context
 def read_mail(ctx, message_id: str):
-    """📖 读取邮件详情。"""
+    """读取邮件详情。支持按序号（先 inbox 查看获取序号）或邮件ID。"""
     passphrase = ctx.obj["passphrase"]
+    resolved_id = _resolve_message_id(message_id)
 
     async def _read():
         engine = _get_engine(passphrase)
         await engine.initialize()
         try:
-            msg = await engine.get_message(message_id)
-            await engine.mark_read(message_id)
+            msg = await engine.get_message(resolved_id)
+            await engine.mark_read(resolved_id)
             return msg
         finally:
             await engine.shutdown()
@@ -414,9 +473,13 @@ def read_mail(ctx, message_id: str):
         border_style="blue",
     ))
 
-    # 正文
-    body = msg.body_text or "(HTML only - 无文本内容)"
-    console.print(Panel(body, title="正文", border_style="dim"))
+    # 正文：纯文本优先，否则 HTML → Markdown
+    body = msg.body_text
+    if not body and msg.body_html:
+        body = _html_to_markdown(msg.body_html)
+    if not body:
+        body = "(no content)"
+    console.print(Panel(Markdown(body), title="正文", border_style="dim"))
 
     # 附件
     if msg.attachments:

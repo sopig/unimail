@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Optional
 
 import httpx
-from msal import ConfidentialClientApplication, PublicClientApplication
+from msal import ConfidentialClientApplication
 
 from .base import MailConnector
 from ..models import (
@@ -45,20 +45,12 @@ class OutlookConnector(MailConnector):
 
     async def connect(self) -> None:
         """Initialize MSAL and HTTP client."""
-        # Use consumers authority for personal accounts when no client_secret
-        if self.config.client_secret:
-            authority = f"https://login.microsoftonline.com/{self.config.tenant_id}"
-            self._msal_app = ConfidentialClientApplication(
-                client_id=self.config.client_id,
-                client_credential=self.config.client_secret,
-                authority=authority,
-            )
-        else:
-            authority = "https://login.microsoftonline.com/consumers"
-            self._msal_app = PublicClientApplication(
-                client_id=self.config.client_id,
-                authority=authority,
-            )
+        authority = f"https://login.microsoftonline.com/{self.config.tenant_id}"
+        self._msal_app = ConfidentialClientApplication(
+            client_id=self.config.client_id,
+            client_credential=self.config.client_secret,
+            authority=authority,
+        )
 
         # Try to get token silently using refresh token
         access_token = await self._get_access_token()
@@ -91,8 +83,12 @@ class OutlookConnector(MailConnector):
             self._persist_tokens()
             return result["access_token"]
 
-        # Fallback to existing token
-        return self._tokens.get("access_token", "")
+        # Refresh failed — provide helpful error
+        error = result.get("error_description", result.get("error", "unknown"))
+        raise ConnectionError(
+            f"Outlook OAuth token refresh failed. Please re-authorize: "
+            f"run `unimail add outlook` again. Error: {error}"
+        )
 
     async def _request(self, method: str, url: str, **kwargs) -> dict:
         """Make authenticated Graph API request with auto-retry on 401."""

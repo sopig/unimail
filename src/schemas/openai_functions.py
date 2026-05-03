@@ -258,7 +258,7 @@ async def _get_engine():
         data_dir = Path.home() / ".unimail" / "data"
         data_dir.mkdir(parents=True, exist_ok=True)
 
-        passphrase = os.environ.get("UNIMAIL_PASSPHRASE", "unimail-default")
+        passphrase = os.environ.get("UNIMAIL_PASSPHRASE")
         _db_instance = Database(data_dir / "unimail.db")
         token_store = TokenStore(data_dir / "tokens.enc", passphrase)
         _engine_instance = MailEngine(_db_instance, token_store)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 from pathlib import Path
 from typing import Any, Optional
 
@@ -12,19 +13,54 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 import base64
 
+# Auto-generated passphrase file — created on first run
+_PASSPHRASE_FILE = Path.home() / ".unimail" / ".passphrase"
+
+
+def _get_or_create_passphrase(explicit: str | None = None) -> str:
+    """Return a passphrase. Priority: explicit arg > env var > saved file > auto-generate.
+
+    Migration: if a tokens.enc exists but no passphrase file, assume legacy
+    "unimail-default" and migrate — generate a new key, re-encrypt, and save.
+    """
+    if explicit:
+        return explicit
+    env_val = os.environ.get("UNIMAIL_PASSPHRASE")
+    if env_val:
+        return env_val
+    if _PASSPHRASE_FILE.exists():
+        return _PASSPHRASE_FILE.read_text().strip()
+
+    # No saved passphrase — check if there's an existing token store to migrate
+    store_path = Path.home() / ".unimail" / "data" / "tokens.enc"
+    if store_path.exists():
+        # Legacy migration: tokens were encrypted with "unimail-default"
+        return "unimail-default"
+
+    # First run: generate a strong random passphrase and save it
+    passphrase = secrets.token_urlsafe(32)
+    _PASSPHRASE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    _PASSPHRASE_FILE.write_text(passphrase)
+    _PASSPHRASE_FILE.chmod(0o600)
+    return passphrase
+
 
 class TokenStore:
     """
     Encrypts OAuth tokens and passwords at rest.
-    
+
     Key derivation: PBKDF2(passphrase + salt) → Fernet key
-    First run: user sets a passphrase to unlock the store.
     """
 
-    def __init__(self, store_path: str | Path, passphrase: str):
+    def __init__(self, store_path: str | Path, passphrase: str | None = None):
         self.store_path = Path(store_path)
         self.store_path.parent.mkdir(parents=True, exist_ok=True)
-        self._fernet = self._derive_fernet(passphrase)
+        # Treat explicit "unimail-default" as not explicitly set (for backward compat)
+        effective = _get_or_create_passphrase(passphrase if passphrase and passphrase != "unimail-default" else None)
+        self._fernet = self._derive_fernet(effective)
+        # If we used the legacy passphrase and a store exists, migrate to auto-generated key
+        if effective == "unimail-default" and self.store_path.exists():
+            self._migrate_passphrase()
 
     def _derive_fernet(self, passphrase: str) -> Fernet:
         salt_path = self.store_path.with_suffix(".salt")
@@ -75,3 +111,21 @@ class TokenStore:
     def list_accounts(self) -> list[str]:
         """List account IDs with stored tokens."""
         return list(self._load_all().keys())
+
+    def _migrate_passphrase(self) -> None:
+        """Re-encrypt token store with a new auto-generated passphrase."""
+        try:
+            data = self._load_all()
+            if not data:
+                return
+            # Generate new passphrase
+            new_passphrase = secrets.token_urlsafe(32)
+            self._fernet = self._derive_fernet(new_passphrase)
+            self._save_all(data)
+            # Save new passphrase file
+            _PASSPHRASE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            _PASSPHRASE_FILE.write_text(new_passphrase)
+            _PASSPHRASE_FILE.chmod(0o600)
+        except Exception:
+            # If migration fails, keep using old passphrase — don't break existing setups
+            pass

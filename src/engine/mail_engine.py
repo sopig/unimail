@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+from datetime import datetime
 from typing import Optional
 
 import markdown
@@ -37,6 +39,7 @@ class MailEngine:
     - Connection pool management
     - In-memory LRU cache
     - Configurable rate limiting
+    - Periodic background sync
     - Webhook notifications
     - Template-based email sending
     """
@@ -48,6 +51,11 @@ class MailEngine:
         self._cache: MailCache = create_mail_cache()
         self._webhook_manager = WebhookManager()
         self._config = get_config()
+        # Periodic sync state
+        self._sync_task: asyncio.Task | None = None
+        self._last_sync_at: Optional[datetime] = None
+        self._new_since_last_check: int = 0
+        self._on_new_messages = None  # callback for notifications
 
     async def initialize(self) -> None:
         """Load all accounts and initialize connectors."""
@@ -55,6 +63,10 @@ class MailEngine:
         for account in accounts:
             await self._init_connector(account)
         logger.info(f"Engine initialized with {len(accounts)} account(s)")
+
+        # Start periodic background sync
+        if self._config.sync.enabled:
+            self.start_periodic_sync()
 
     async def _init_connector(self, account: MailAccount) -> MailConnector:
         """Create and connect a connector for an account."""
@@ -459,6 +471,9 @@ class MailEngine:
             logger.info(f"Synced {total_new} new message(s), notifying webhooks")
             await self._webhook_manager.notify_new_messages(all_new_messages)
 
+        # Update last sync timestamp
+        self._last_sync_at = datetime.now()
+
         return total_new
 
     @property
@@ -466,9 +481,72 @@ class MailEngine:
         """Access the webhook manager for registration/management."""
         return self._webhook_manager
 
+    # === Periodic Sync ===
+
+    def start_periodic_sync(self) -> None:
+        """Start the background periodic sync task."""
+        if self._sync_task and not self._sync_task.done():
+            return
+        interval = self._config.sync.interval
+        self._sync_task = asyncio.create_task(self._periodic_sync_loop(interval))
+        logger.info(f"Periodic sync started (interval={interval}s)")
+
+    def stop_periodic_sync(self) -> None:
+        """Cancel the background sync task."""
+        if self._sync_task and not self._sync_task.done():
+            self._sync_task.cancel()
+            logger.info("Periodic sync stopped")
+        self._sync_task = None
+
+    async def _periodic_sync_loop(self, interval: int) -> None:
+        """Background loop that syncs all accounts periodically."""
+        try:
+            while True:
+                await asyncio.sleep(interval)
+                try:
+                    count = await self.sync_all()
+                    if count > 0:
+                        self._new_since_last_check += count
+                        logger.info(f"Periodic sync: {count} new message(s)")
+                        # Trigger notification callback if registered
+                        if self._on_new_messages:
+                            await self._on_new_messages(count)
+                except Exception as e:
+                    logger.error(f"Periodic sync error: {e}")
+        except asyncio.CancelledError:
+            pass
+
+    async def check_new_messages(self) -> dict:
+        """Check for new messages since the last call.
+
+        Returns a summary of new messages and resets the counter.
+        Called by the Agent via the mail_check_new MCP tool.
+        """
+        last_sync = self._last_sync_at
+        new_count = self._new_since_last_check
+        self._new_since_last_check = 0
+
+        if new_count == 0:
+            return {"new_count": 0, "last_sync_at": last_sync.isoformat() if last_sync else None, "messages": []}
+
+        # Query DB for messages received since last check
+        since_str = last_sync.isoformat() if last_sync else None
+        recent = self.db.get_messages(limit=new_count + 10)
+        if since_str:
+            recent = [m for m in recent if m.get("received_at", "") > since_str]
+        recent = recent[:new_count]
+
+        messages = [self._dict_to_message(m) for m in recent]
+        return {
+            "new_count": new_count,
+            "last_sync_at": last_sync.isoformat() if last_sync else None,
+            "messages": messages,
+        }
+
     async def shutdown(self) -> None:
         """Disconnect all connectors."""
         logger.info("Shutting down engine")
+        self.stop_periodic_sync()
         for connector in self._connectors.values():
             try:
                 await connector.disconnect()

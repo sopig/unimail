@@ -34,7 +34,7 @@ def _get_engine() -> MailEngine:
     """创建 MailEngine 实例。"""
     data_dir = Path.home() / ".unimail" / "data"
     data_dir.mkdir(parents=True, exist_ok=True)
-    passphrase = os.environ.get("UNIMAIL_PASSPHRASE", "unimail-default")
+    passphrase = os.environ.get("UNIMAIL_PASSPHRASE")
     db = Database(data_dir / "unimail.db")
     token_store = TokenStore(data_dir / "tokens.enc", passphrase)
     return MailEngine(db, token_store)

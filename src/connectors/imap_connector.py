@@ -47,10 +47,18 @@ class ImapSmtpConnector(MailConnector):
     def __init__(self, account: MailAccount, password: str, token_store=None):
         super().__init__(account, token_store=token_store)
         self.config: ImapConfig = account.config  # type: ignore
-        self.password = password
+        self._password = password  # internal, excluded from repr/logging
         self._connection: Optional[aioimaplib.IMAP4_SSL] = None
         self._last_activity: float = 0.0
         self._connection_timeout: int = get_config().imap.connection_timeout
+        self._noop_task: Optional[asyncio.Task] = None
+
+    @property
+    def password(self) -> str:
+        return self._password
+
+    def __repr__(self) -> str:
+        return f"ImapSmtpConnector({self.account.email})"
 
     @property
     def is_connected(self) -> bool:
@@ -114,14 +122,60 @@ class ImapSmtpConnector(MailConnector):
             extra={"account_id": self.account.id, "connector": "imap"},
         )
 
+        # Start NOOP keepalive
+        self._start_noop_keepalive()
+
     async def _ensure_connected(self) -> None:
         """Ensure connection is alive, reconnecting if necessary."""
         if not self.is_connected:
-            await self.connect()
+            try:
+                await self.connect()
+            except Exception as e:
+                logger.warning(
+                    f"Reconnect failed: {e}, retrying once",
+                    extra={"account_id": self.account.id},
+                )
+                # Single retry with fresh connection
+                self._connection = None
+                await self.connect()
         self._last_activity = time.time()
+
+    def _start_noop_keepalive(self) -> None:
+        """Start a background task that sends NOOP to keep the IMAP connection alive."""
+        if self._noop_task and not self._noop_task.done():
+            return
+        interval = max(self._connection_timeout // 2, 60)  # NOOP at half the timeout, min 60s
+        self._noop_task = asyncio.create_task(self._noop_loop(interval))
+
+    def _stop_noop_keepalive(self) -> None:
+        """Cancel the NOOP keepalive task."""
+        if self._noop_task and not self._noop_task.done():
+            self._noop_task.cancel()
+        self._noop_task = None
+
+    async def _noop_loop(self, interval: int) -> None:
+        """Periodically send NOOP to keep the IMAP connection alive."""
+        try:
+            while True:
+                await asyncio.sleep(interval)
+                if self._connection and self.is_connected:
+                    try:
+                        await self._connection.noop()
+                        self._last_activity = time.time()
+                        logger.debug("NOOP sent", extra={"account_id": self.account.id})
+                    except Exception as e:
+                        logger.debug(
+                            f"NOOP failed: {e}, connection may be stale",
+                            extra={"account_id": self.account.id},
+                        )
+                        # Mark as stale so next _ensure_connected will reconnect
+                        self._last_activity = 0.0
+        except asyncio.CancelledError:
+            pass
 
     async def disconnect(self) -> None:
         """Disconnect from IMAP."""
+        self._stop_noop_keepalive()
         if self._connection:
             logger.info(
                 "Disconnecting from IMAP",
@@ -356,9 +410,9 @@ class ImapSmtpConnector(MailConnector):
 
         criteria_parts = []
         if query:
-            criteria_parts.append(f'BODY "{query}"')
+            criteria_parts.append(f'BODY "{self._imap_escape(query)}"')
         if from_filter:
-            criteria_parts.append(f'FROM "{from_filter}"')
+            criteria_parts.append(f'FROM "{self._imap_escape(from_filter)}"')
         if date_from:
             dt = datetime.fromisoformat(date_from)
             criteria_parts.append(f'SINCE {dt.strftime("%d-%b-%Y")}')
@@ -447,6 +501,11 @@ class ImapSmtpConnector(MailConnector):
         return messages
 
     # === Helpers ===
+
+    @staticmethod
+    def _imap_escape(value: str) -> str:
+        """Escape special characters in IMAP quoted strings."""
+        return value.replace("\\", "\\\\").replace('"', '\\"')
 
     def _map_folder(self, folder: str) -> str:
         """Map unified folder names to IMAP folder names."""
