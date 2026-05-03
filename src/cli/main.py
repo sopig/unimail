@@ -65,8 +65,61 @@ def _resolve_message_id(message_id: str) -> str:
     return message_id
 
 
-def _html_to_markdown(html: str) -> str:
-    """Convert HTML to Markdown for terminal display."""
+def _ensure_w3m() -> bool:
+    """Check if w3m is available, offer to install if not."""
+    import shutil
+    import subprocess
+
+    if shutil.which("w3m"):
+        return True
+
+    console.print("[dim]w3m not found — installing for better HTML email rendering...[/dim]")
+    pkg_mgr = shutil.which("brew") or shutil.which("apt-get") or shutil.which("dnf")
+    if not pkg_mgr:
+        return False
+
+    cmd = pkg_mgr
+    if "brew" in pkg_mgr:
+        cmd = "brew install w3m"
+    elif "apt-get" in pkg_mgr:
+        cmd = "sudo apt-get install -y w3m"
+    elif "dnf" in pkg_mgr:
+        cmd = "sudo dnf install -y w3m"
+
+    try:
+        subprocess.run(cmd, shell=True, check=True, timeout=120)
+        return shutil.which("w3m") is not None
+    except Exception:
+        return False
+
+
+def _html_to_terminal(html: str) -> str:
+    """Convert HTML to readable terminal text. Prefers w3m, falls back to html2text."""
+    import re
+    import subprocess
+    import tempfile
+
+    # Try w3m first — much cleaner output for complex HTML emails
+    if _ensure_w3m():
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".html", mode="w", delete=False) as f:
+                f.write(html)
+                f.flush()
+                result = subprocess.run(
+                    ["w3m", "-dump", "-T", "text/html", "-cols", "80", f.name],
+                    capture_output=True, text=True, timeout=5,
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    text = result.stdout.strip()
+                    # Remove w3m image placeholders like [108353-1x1]
+                    text = re.sub(r"\[[\w-]{3,20}\]", "", text)
+                    # Collapse blank lines
+                    text = re.sub(r"\n{3,}", "\n\n", text)
+                    return text.strip()
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
+
+    # Fallback: html2text → Markdown
     try:
         import html2text
         h = html2text.HTML2Text()
@@ -75,7 +128,6 @@ def _html_to_markdown(html: str) -> str:
         h.body_width = 0
         return h.handle(html).strip()
     except Exception:
-        import re
         return re.sub(r"<[^>]+>", "", html).strip()
 
 
@@ -476,7 +528,7 @@ def read_mail(ctx, message_id: str):
     # 正文：纯文本优先，否则 HTML → Markdown
     body = msg.body_text
     if not body and msg.body_html:
-        body = _html_to_markdown(msg.body_html)
+        body = _html_to_terminal(msg.body_html)
     if not body:
         body = "(no content)"
     console.print(Panel(Markdown(body), title="正文", border_style="dim"))
